@@ -45,6 +45,7 @@ namespace NAADF.World.Data
         public EntityHandler entityHandler;
         public ChangeHandler changeHandler;
         public EditingHandler editingHandler;
+        public FluidHandler fluidHandler;
 
         private const int GPU_MAX_ELEMENTS_UINT = 1024 * 1024 * 511;
         private static Effect chunkProcessor;
@@ -61,6 +62,10 @@ namespace NAADF.World.Data
             this.worldGenSegmentSizeInVoxels = worldGenSegmentSizeInChunks * 16;
             this.sizeInWorldGenSegments = (actualSizeInVoxels + new Point3(worldGenSegmentSizeInVoxels - 1)) / worldGenSegmentSizeInVoxels;
             this.sizeInVoxels = sizeInWorldGenSegments * worldGenSegmentSizeInVoxels;
+            // Spatial hierarchy, each level is 4x coarser per axis than the one below it:
+            // voxel -> block (4^3 = 64 voxels) -> chunk (4^3 = 64 blocks = 16^3 voxels) -> queue group (4^3 chunks).
+            // dataVoxel/dataBlock/dataChunk mirror these levels; the top 2 bits of a node say whether it
+            // is empty, uniform, or a pointer down to the next level (see FillChunkData/RayTraversal).
             this.sizeInBlocks = sizeInVoxels / 4;
             this.sizeInChunks = sizeInBlocks / 4;
             this.sizeInQueueGroups = sizeInChunks / 4;
@@ -89,6 +94,7 @@ namespace NAADF.World.Data
             changeHandler = new ChangeHandler(this);
             entityHandler = new EntityHandler(this);
             editingHandler = new EditingHandler(this);
+            fluidHandler = new FluidHandler(this);
             blockHashingHandler = new BlockHashingHandler(this, 0, 0.5f, (worldGenSegmentSizeInVoxels * worldGenSegmentSizeInVoxels * worldGenSegmentSizeInVoxels) / 64);
         }
 
@@ -113,10 +119,13 @@ namespace NAADF.World.Data
 
             entityHandler.Update(gameTime, WorldRender.render.taaIndex);
             editingHandler.Update(gameTime);
+            fluidHandler.Update(gameTime);
             changeHandler.Update();
             boundHandler.Update();
         }
 
+        // Builds the entire world on the GPU one worldGen segment at a time, then pulls the resulting
+        // chunk/block/voxel data back into the CPU mirror arrays so editing/raycasting can run on the CPU.
         public void GenerateWorld(WorldGenerator worldGenerator)
         {
             isLoaded = false;
@@ -217,11 +226,13 @@ namespace NAADF.World.Data
             isLoaded = true;
         }
 
+        // Expands one chunk into a flat 2048-uint buffer (4096 voxels packed 2-per-uint) by walking the
+        // node tree: state 2 = pointer to children, otherwise the whole subtree is one uniform type.
         public void FillChunkData(int chunkIndex, uint[] buffer, int offset)
         {
             uint chunk = dataChunk[chunkIndex];
-            uint chunkState = chunk >> 30;
-            uint chunkContent = chunk & 0x3FFFFFFF;
+            uint chunkState = chunk >> 30;          // top 2 bits: 0 empty, 1 uniform type, 2 pointer to 64 blocks
+            uint chunkContent = chunk & 0x3FFFFFFF; // low 30 bits: the type id, or the base index into dataBlock
             if (chunkState != 2)
             {
                 uint type = chunkState == 1 ? ((1 << 15) | chunkContent) : 0u;
@@ -292,6 +303,8 @@ namespace NAADF.World.Data
             }
         }
 
+        // Allocates a 64-voxel block worth of storage (32 uints, since voxels are packed 2-per-uint) and
+        // copies the data in. Reuses a freed slot if one exists, otherwise grows the high-water mark.
         public uint AddVoxels(Span<uint> voxels)
         {
             uint location = 0;
@@ -300,6 +313,7 @@ namespace NAADF.World.Data
                 location = freeLocation;
             else
             {
+                // voxelCount counts voxels; divide by 2 to get the uint index because of the 2-per-uint packing.
                 uint newVoxelCount = Interlocked.Add(ref voxelCount, 64);
                 location = (newVoxelCount - 64) / 2;
             }
@@ -384,6 +398,7 @@ namespace NAADF.World.Data
             bool curHasContent = (curChunk >> 30) != 0;
             bool newHasContent = (chunkData >> 30) != 0;
 
+            // If the old chunk pointed to 64 blocks and the new one doesn't, recycle that block slot for reuse.
             // Remove existing blocks
             if ((curChunk >> 30) == 2 && (chunkData >> 30) != 2)
                 freeBlockSlots.Enqueue(curChunk & 0x3FFFFFFF);
@@ -393,6 +408,9 @@ namespace NAADF.World.Data
                 changeHandler.AddChangedChunk(chunkIndex);
         }
 
+        // CPU hierarchical DDA voxel raycast (mirrors the GPU traversal shader). Steps cell-by-cell, but skips
+        // whole empty chunks/blocks by clamping each step to the current node's bounds. Returns the hit type
+        // (0 = miss) and outputs hit distance, voxel position, and face normal.
         public uint RayTraversal(Vector3 rayOrigin, Vector3 rayDir, out float resultLength, out Point3 voxelPos, out Point3 normal)
         {
             Vector3 startPos = rayOrigin;
