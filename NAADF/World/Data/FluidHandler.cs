@@ -4,6 +4,7 @@ using NAADF.Common;
 using NAADF.Gui;
 using NAADF.World.Render;
 using System;
+using System.Collections.Generic;
 
 namespace NAADF.World.Data
 {
@@ -17,8 +18,15 @@ namespace NAADF.World.Data
     {
         private WorldData worldData;
 
+        // Separate empty/fluid grid, decoupled from the engine's solid-voxel node tree. This is the
+        // simulation's source of truth; ApplyToWorld only ever reads it to decide what to draw.
+        private FluidGrid fluidGrid;
+
         // The render-table index of the material our fluid voxel uses. Registered once at construction.
         private uint fluidTypeRenderIndex;
+
+        // Cells whose fluid state changed since the last ApplyToWorld call, drained (and re-drawn) each apply.
+        private List<Point3> dirtyCells = new List<Point3>();
 
         // Simulation state
         private bool hasCell = false;
@@ -36,6 +44,7 @@ namespace NAADF.World.Data
         public FluidHandler(WorldData worldData)
         {
             this.worldData = worldData;
+            fluidGrid = new FluidGrid(worldData.sizeInVoxels);
 
             // A new voxel type is created with a unique ID, color, and material properties. Emissive so that it is properly visible regardless of the scene
             // The render index of this new voxel type is stored for later use when writing to the world.
@@ -86,16 +95,19 @@ namespace NAADF.World.Data
             Point3 spawn = Point3.FromVector3(camPos + camDir * 20f);
 
             // The check is done on the spawn point and the farthest point along the path, which is RangeSteps away in the +X direction.
-            if (!IsInsideWorld(spawn) || !IsInsideWorld(spawn + new Point3(RangeSteps, 0, 0)))
+            if (!fluidGrid.IsInside(spawn) || !fluidGrid.IsInside(spawn + new Point3(RangeSteps, 0, 0)))
             {
                 Console.WriteLine("FluidHandler: spawn point is outside the world, aim somewhere else and press G again.");
                 return;
             }
 
-            // If a voxel already exists, erase it before moving the origin so we don't leave a stray cell behind.
+            // If a voxel already exists, clear it from the grid before moving the origin so we don't leave a stray cell behind.
             // If commented out the previous voxel will remain still in the world and a new one will be spawned at the new location.
             if (hasCell)
-                WriteCell(currentCell, isErase: true);
+            {
+                fluidGrid.SetFluid(currentCell, false);
+                dirtyCells.Add(currentCell);
+            }
 
             originCell = spawn;
             currentCell = spawn;
@@ -103,41 +115,50 @@ namespace NAADF.World.Data
             stepDir = 1;
             moveAccumulatorMs = 0f;
             hasCell = true;
+            fluidGrid.SetFluid(currentCell, true);
+            dirtyCells.Add(currentCell);
 
             ApplyToWorld(); // make the freshly spawned voxel appear immediately
             Console.WriteLine($"FluidHandler: spawned voxel at ({spawn.X}, {spawn.Y}, {spawn.Z}).");
         }
 
-        // To decide where the voxel goes next. No engine interaction here on purpose. 
+        // To decide where the voxel goes next. No engine interaction here on purpose.
         // Will do more complex fluid simulation math later, but for now it just moves back and forth along the X axis.
+        // Updates fluidGrid directly so the grid is always the source of truth for what's fluid.
         private void StepSimulation()
         {
+            Point3 previousCell = currentCell;
+
             travel += stepDir;
             if (travel >= RangeSteps || travel <= 0)
                 stepDir = -stepDir; // bounce at either end so the voxel stays near the spawn point
 
             currentCell = originCell + new Point3(travel, 0, 0);
+
+            fluidGrid.SetFluid(previousCell, false);
+            fluidGrid.SetFluid(currentCell, true);
+            dirtyCells.Add(previousCell);
+            dirtyCells.Add(currentCell);
         }
 
-        // Display/apply step: erase the previous cell, draw the current cell, then push to the GPU.
-        // This is the part that is intentionally swappable for a more efficient implementation later.
+        // Display/apply step: re-draws every cell whose fluid state changed since the last apply, then
+        // pushes to the GPU. This is the part that is intentionally swappable for a more efficient
+        // implementation later; it only ever reads fluidGrid, never decides fluid state itself.
         private void ApplyToWorld()
         {
-            // The voxel moved at most one cell, so the previous position is one step back along the path.
-            Point3 previousCell = originCell + new Point3(travel - stepDir, 0, 0);
-
-            if (!previousCell.Equals(currentCell))
-                WriteCell(previousCell, isErase: true);
-            WriteCell(currentCell, isErase: false);
+            foreach (Point3 cell in dirtyCells)
+                WriteCell(cell);
+            dirtyCells.Clear();
 
             // Stage the edited chunks through the same way the editing tools use. ChangeHandler.Update() then uploads everything to the GPU.
             worldData.editingHandler.processChunks(false);
         }
 
-        // Translate a world-voxel position into the engine's chunk + in-chunk coordinates and write one voxel.
-        private void WriteCell(Point3 worldVoxel, bool isErase)
+        // Translate a world-voxel position into the engine's chunk + in-chunk coordinates and write one voxel,
+        // reading fluidGrid to decide whether it should be drawn as fluid or erased back to empty.
+        private void WriteCell(Point3 worldVoxel)
         {
-            if (!IsInsideWorld(worldVoxel))
+            if (!fluidGrid.IsInside(worldVoxel))
                 return;
 
             Point3 chunkPos = worldVoxel / 16;          // which chunk contains this voxel, in chunk-grid coordinate
@@ -145,16 +166,8 @@ namespace NAADF.World.Data
 
             uint pointer = worldData.editingHandler.getChunkDataToEdit(chunkPos);
             // Voxel encoding: bit 15 = "solid" flag, low 15 bits = material render index. 0 means empty/air.
-            uint type = isErase ? 0u : (1u << 15) | fluidTypeRenderIndex;
+            uint type = fluidGrid.IsFluid(worldVoxel) ? (1u << 15) | fluidTypeRenderIndex : 0u;
             worldData.editingHandler.setVoxelData(pointer, voxelPosInChunk, type);
-        }
-
-        private bool IsInsideWorld(Point3 p)
-        {
-            return p.X >= 0 && p.Y >= 0 && p.Z >= 0
-                && p.X < worldData.sizeInVoxels.X
-                && p.Y < worldData.sizeInVoxels.Y
-                && p.Z < worldData.sizeInVoxels.Z;
         }
     }
 }
