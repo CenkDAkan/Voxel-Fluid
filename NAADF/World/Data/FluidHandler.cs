@@ -28,13 +28,18 @@ namespace NAADF.World.Data
         // Cells whose fluid state changed since the last ApplyToWorld call, drained (and re-drawn) each apply.
         private List<Point3> dirtyCells = new List<Point3>();
 
-        // Simulation state
-        private bool hasCell = false;
-        private Point3 currentCell;          // the voxel currentPosition is currently floored/snapped to; what fluidGrid marks as fluid
-        private Vector3 currentPosition;     // voxel position, integrated every physics step
+        // One simulated voxel of fluid. Velocity itself lives on fluidGrid (keyed by currentCell), this just tracks which 
+        // cell/continuous position belongs to which particle so multiple can be integrated independently per frame.
+        private class Particle
+        {
+            public Point3 currentCell;       // the voxel currentPosition is currently floored/snapped to; what fluidGrid marks as fluid
+            public Vector3 currentPosition;  // voxel position, integrated every physics step
+        }
 
-        // Gravity is applied as the external-forces term of the Navier-Stokes equation (u(t+dt) = u(t) + F*dt). 
-        // The engine has no defined real-world unit scale (a voxel isn't "1 meter" anywhere), 
+        private List<Particle> particles = new List<Particle>();
+
+        // Gravity is applied as the external-forces term of the Navier-Stokes equation (u(t+dt) = u(t) + F*dt).
+        // The engine has no defined real-world unit scale (a voxel isn't "1 meter" anywhere),
         // so this magnitude is arbitrary and be changed at any point for fine tuning
         private Vector3 gravity = new Vector3(0f, -20f, 0f);
 
@@ -42,6 +47,29 @@ namespace NAADF.World.Data
         // stable regardless of framerate. The accumulator banks elapsed time between ticks, same as the demo
         private float physicsIntervalMs = 16f;
         private float physicsAccumulatorMs = 0f;
+
+        // Hose emitter: while held, spawns particles from the camera position at a fixed cadence
+        private float hoseSpeed = 40f;
+        private float hoseIntervalMs = 50f;
+        private float hoseAccumulatorMs = 0f;
+
+        // Sprinkler: a placed emitter. Its base is a static marker voxel, drawn directly and never touched by the fluid grid/dirty-cell system 
+        // so the fluid stream can't erase it. Its launch direction rotates left and right 
+        // around the facing direction it was placed with and is tilted upward, so gravity arcs each launch into the ground
+        private class Sprinkler
+        {
+            public Point3 position;       // base cell, holds the static marker voxel
+            public Vector3 forwardXZ;     // horizontal reference direction, fixed at placement time
+            public float angleDeg;        // current offset from forwardXZ, rotates within +-(sprinklerArcDegrees/2)
+            public int sweepDir;          // +1 or -1, flips when angleDeg hits an arc limit
+            public float emitAccumulatorMs;
+        }
+
+        private List<Sprinkler> sprinklers = new List<Sprinkler>();
+        private uint sprinklerTypeRenderIndex;
+        private float sprinklerArcDegrees = 120f;
+        private float sprinklerAngularSpeedDegPerSec = 90f;
+        private float sprinklerTiltDegrees = 35f;
 
         public FluidHandler(WorldData worldData)
         {
@@ -60,14 +88,29 @@ namespace NAADF.World.Data
                 roughness = 1.0f,
             };
             // store the render-table index for later use, taken from the return value of ApplyVoxelType in voxelTypeHandler
-            fluidTypeRenderIndex = App.worldHandler.voxelTypeHandler.ApplyVoxelType(fluidType).renderIndex; 
+            fluidTypeRenderIndex = App.worldHandler.voxelTypeHandler.ApplyVoxelType(fluidType).renderIndex;
+
+            // Distinct color from the fluid itself so a placed sprinkler's base is visually identifiable.
+            VoxelType sprinklerType = new VoxelType
+            {
+                ID = "fluid_sprinkler_head",
+                colorBase = new Vector3(1.0f, 0.5f, 0.1f),
+                colorLayered = Vector3.Zero,
+                materialBase = MaterialTypeBase.Emissive,
+                materialLayer = MaterialTypeLayer.None,
+                roughness = 1.0f,
+            };
+            sprinklerTypeRenderIndex = App.worldHandler.voxelTypeHandler.ApplyVoxelType(sprinklerType).renderIndex;
         }
 
         public void Update(float gameTime)
         {
             HandleSpawnInput();
+            HandleHoseInput(gameTime);
+            HandlePlaceSprinklerInput();
+            HandleSprinklers(gameTime);
 
-            if (!hasCell)
+            if (particles.Count == 0)
                 return;
 
             // Advance the simulation on a fixed cadence.
@@ -81,12 +124,12 @@ namespace NAADF.World.Data
                 if (physicsIntervalMs <= 0f) break; // avoid an infinite loop if physicsIntervalMs is set to 0
             }
 
-            // ApplyToWorld is only called when the voxel actually moves rather than every frame
+            // ApplyToWorld is only called when a voxel actually moved rather than every frame
             if (moved)
                 ApplyToWorld();
         }
 
-        // Spawn or respawn the voxel a few cells in front of the camera when G is pressed.
+        // Drop one voxel a few cells in front of the camera when G is pressed, with no initial velocity
         private void HandleSpawnInput()
         {
             if (!IO.KBStates.IsKeyToggleDown(Keys.G))
@@ -96,60 +139,169 @@ namespace NAADF.World.Data
             Vector3 camDir = WorldRender.camera.GetDir();
             Point3 spawn = Point3.FromVector3(camPos + camDir * 20f);
 
-            if (!fluidGrid.IsInside(spawn))
+            SpawnParticle(spawn, Vector3.Zero);
+        }
+
+        // While H is held, spawns a stream of voxels from the camera position at a fixed cadence
+        private void HandleHoseInput(float gameTime)
+        {
+            if (!IO.KBStates.New.IsKeyDown(Keys.H))
             {
-                Console.WriteLine("FluidHandler: spawn point is outside the world, aim somewhere else and press G again.");
+                hoseAccumulatorMs = 0f; // reset so the stream starts immediately next time H is held
                 return;
             }
 
-            // If a voxel already exists, clear it from the grid before moving the origin so we don't leave a stray cell behind.
-            // If commented out the previous voxel will remain still in the world and a new one will be spawned at the new location.
-            if (hasCell)
+            hoseAccumulatorMs += gameTime;
+            while (hoseAccumulatorMs >= hoseIntervalMs)
             {
-                fluidGrid.SetFluid(currentCell, false);
-                dirtyCells.Add(currentCell);
+                hoseAccumulatorMs -= hoseIntervalMs;
+
+                Vector3 camPos = WorldRender.camera.GetPos().toVector3();
+                Vector3 camDir = WorldRender.camera.GetDir();
+                Point3 spawn = Point3.FromVector3(camPos + camDir * 4f);
+
+                SpawnParticle(spawn, camDir * hoseSpeed);
             }
-
-            currentCell = spawn;
-            currentPosition = spawn.ToVector3();
-            physicsAccumulatorMs = 0f;
-            hasCell = true;
-            fluidGrid.SetFluid(currentCell, true);
-            dirtyCells.Add(currentCell);
-
-            ApplyToWorld(); // make the freshly spawned voxel appear immediately
-            Console.WriteLine($"FluidHandler: spawned voxel at ({spawn.X}, {spawn.Y}, {spawn.Z}).");
         }
 
-        // Integrates gravity into the cell's velocity, then integrates velocity into its continuous position. 
-        // Once the continuous position crosses into a neighboring voxel, the grid entry moves there too. 
+        // Places a new sprinkler when J is pressed, the marker voxel is written once and is not part of the fluid grid
+        private void HandlePlaceSprinklerInput()
+        {
+            if (!IO.KBStates.IsKeyToggleDown(Keys.J))
+                return;
+
+            Vector3 camPos = WorldRender.camera.GetPos().toVector3();
+            Vector3 camDir = WorldRender.camera.GetDir();
+            Point3 spawn = Point3.FromVector3(camPos + camDir * 20f);
+
+            if (!fluidGrid.IsInside(spawn))
+            {
+                Console.WriteLine("FluidHandler: sprinkler point is outside the world, aim somewhere else.");
+                return;
+            }
+
+            Vector3 forwardXZ = new Vector3(camDir.X, 0f, camDir.Z);
+            forwardXZ = forwardXZ.LengthSquared() > 1e-6f ? Vector3.Normalize(forwardXZ) : Vector3.UnitZ;
+
+            sprinklers.Add(new Sprinkler
+            {
+                position = spawn,
+                forwardXZ = forwardXZ,
+                angleDeg = 0f,
+                sweepDir = 1,
+                emitAccumulatorMs = 0f,
+            });
+
+            PlaceMarkerVoxel(spawn, sprinklerTypeRenderIndex);
+            Console.WriteLine($"FluidHandler: placed sprinkler at ({spawn.X}, {spawn.Y}, {spawn.Z}).");
+        }
+
+        // Advances each sprinkler's rotation and, on its own cadence, launches a particle in its current direction
+        private void HandleSprinklers(float gameTime)
+        {
+            foreach (Sprinkler sprinkler in sprinklers)
+            {
+                float halfArc = sprinklerArcDegrees * 0.5f;
+                sprinkler.angleDeg += sprinklerAngularSpeedDegPerSec * (gameTime / 1000f) * sprinkler.sweepDir;
+                if (sprinkler.angleDeg > halfArc)
+                {
+                    sprinkler.angleDeg = halfArc;
+                    sprinkler.sweepDir = -1;
+                }
+                else if (sprinkler.angleDeg < -halfArc)
+                {
+                    sprinkler.angleDeg = -halfArc;
+                    sprinkler.sweepDir = 1;
+                }
+
+                sprinkler.emitAccumulatorMs += gameTime;
+                while (sprinkler.emitAccumulatorMs >= hoseIntervalMs)
+                {
+                    sprinkler.emitAccumulatorMs -= hoseIntervalMs;
+
+                    Vector3 horizontal = Vector3.Transform(sprinkler.forwardXZ, Matrix.CreateRotationY(MathHelper.ToRadians(sprinkler.angleDeg)));
+                    float tiltRad = MathHelper.ToRadians(sprinklerTiltDegrees);
+                    Vector3 launchDir = horizontal * (float)Math.Cos(tiltRad) + Vector3.Up * (float)Math.Sin(tiltRad);
+
+                    // Emit from one cell above the marker so the stream's own dirty-cell writes never touch (and erase) the marker voxel.
+                    Point3 emitCell = sprinkler.position + new Point3(0, 1, 0);
+                    SpawnParticle(emitCell, launchDir * hoseSpeed);
+                }
+            }
+        }
+
+        // Writes a single static voxel directly, bypassing fluidGrid entirely, used for the sprinkler's
+        // base marker, which must never be picked up/erased by the fluid simulation's dirty-cell system.
+        private void PlaceMarkerVoxel(Point3 worldVoxel, uint typeRenderIndex)
+        {
+            Point3 chunkPos = worldVoxel / 16;
+            Point3 voxelPosInChunk = worldVoxel % 16;
+
+            uint pointer = worldData.editingHandler.getChunkDataToEdit(chunkPos);
+            uint type = (1u << 15) | typeRenderIndex;
+            worldData.editingHandler.setVoxelData(pointer, voxelPosInChunk, type);
+
+            worldData.editingHandler.processChunks(false);
+        }
+
+        // Adds one new fluid particle at cell with the given initial velocity 
+        // (the "impulse" is zero for a plain dropped voxel, camDir * hoseSpeed for the hose)
+        // Skips cells already marked fluid rather than merging into them
+        private void SpawnParticle(Point3 cell, Vector3 initialVelocity)
+        {
+            if (!fluidGrid.IsInside(cell))
+            {
+                Console.WriteLine("FluidHandler: spawn point is outside the world, aim somewhere else.");
+                return;
+            }
+
+            if (fluidGrid.IsFluid(cell))
+                return;
+
+            particles.Add(new Particle { currentCell = cell, currentPosition = cell.ToVector3() });
+
+            fluidGrid.SetFluid(cell, true);
+            fluidGrid.SetVelocity(cell, initialVelocity);
+            dirtyCells.Add(cell);
+
+            ApplyToWorld(); // make the freshly spawned voxel appear immediately
+        }
+
+        // Integrates gravity into each particle's velocity, then integrates velocity into its continuous position
+        // Once a particle's continuous position crosses into a neighboring voxel, its grid entry moves there too
         // fluidGrid stays the source of truth for both fluid state and velocity. No collision checks yet
         private void StepPhysics(float dt)
         {
-            Vector3 velocity = fluidGrid.GetVelocity(currentCell);
+            foreach (Particle particle in particles)
+                StepParticle(particle, dt);
+        }
+
+        private void StepParticle(Particle particle, float dt)
+        {
+            Vector3 velocity = fluidGrid.GetVelocity(particle.currentCell);
             velocity += gravity * dt;
 
-            Vector3 newPosition = currentPosition + velocity * dt;
+            Vector3 newPosition = particle.currentPosition + velocity * dt;
             Point3 newCell = Point3.FromVector3(newPosition);
 
             if (!fluidGrid.IsInside(newCell))
             {
-                newPosition = currentCell.ToVector3();
-                newCell = currentCell;
+                newPosition = particle.currentCell.ToVector3();
+                newCell = particle.currentCell;
                 velocity = Vector3.Zero;
             }
 
-            if (!newCell.Equals(currentCell))
+            if (!newCell.Equals(particle.currentCell))
             {
-                fluidGrid.SetFluid(currentCell, false);
-                dirtyCells.Add(currentCell);
-                currentCell = newCell;
-                fluidGrid.SetFluid(currentCell, true);
-                dirtyCells.Add(currentCell);
+                fluidGrid.SetFluid(particle.currentCell, false);
+                dirtyCells.Add(particle.currentCell);
+                particle.currentCell = newCell;
+                fluidGrid.SetFluid(particle.currentCell, true);
+                dirtyCells.Add(particle.currentCell);
             }
 
-            currentPosition = newPosition;
-            fluidGrid.SetVelocity(currentCell, velocity);
+            particle.currentPosition = newPosition;
+            fluidGrid.SetVelocity(particle.currentCell, velocity);
         }
 
         // Display/apply step: re-draws every cell whose fluid state changed since the last apply, then
