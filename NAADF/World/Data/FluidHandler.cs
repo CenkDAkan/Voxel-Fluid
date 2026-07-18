@@ -30,16 +30,18 @@ namespace NAADF.World.Data
 
         // Simulation state
         private bool hasCell = false;
-        private Point3 originCell;
-        private Point3 currentCell;
-        private int travel = 0;              // how far along the path we are, in voxels, from originCell
-        private int stepDir = 1;             // +1 / -1, flips when we reach either end of the path
-        private const int RangeSteps = 40;   // how many voxels the demo voxel travels before bouncing back
+        private Point3 currentCell;          // the voxel currentPosition is currently floored/snapped to; what fluidGrid marks as fluid
+        private Vector3 currentPosition;     // voxel position, integrated every physics step
 
-        // Movement of the fluid voxel is determined by the interval variable. 
-        // The accumulator variable banks the elapsed time since the last movement, allowing for smooth and consistent updates regardless of frame rate.
-        private float moveIntervalMs = 60f;
-        private float moveAccumulatorMs = 0f;
+        // Gravity is applied as the external-forces term of the Navier-Stokes equation (u(t+dt) = u(t) + F*dt). 
+        // The engine has no defined real-world unit scale (a voxel isn't "1 meter" anywhere), 
+        // so this magnitude is arbitrary and be changed at any point for fine tuning
+        private Vector3 gravity = new Vector3(0f, -20f, 0f);
+
+        // Physics runs on a fixed tick rather than the raw (variable) frame delta, so integration stays
+        // stable regardless of framerate. The accumulator banks elapsed time between ticks, same as the demo
+        private float physicsIntervalMs = 16f;
+        private float physicsAccumulatorMs = 0f;
 
         public FluidHandler(WorldData worldData)
         {
@@ -69,14 +71,14 @@ namespace NAADF.World.Data
                 return;
 
             // Advance the simulation on a fixed cadence.
-            moveAccumulatorMs += gameTime;
+            physicsAccumulatorMs += gameTime;
             bool moved = false;
-            while (moveAccumulatorMs >= moveIntervalMs)
+            while (physicsAccumulatorMs >= physicsIntervalMs)
             {
-                moveAccumulatorMs -= moveIntervalMs;
-                StepSimulation();
+                physicsAccumulatorMs -= physicsIntervalMs;
+                StepPhysics(physicsIntervalMs / 1000f);
                 moved = true;
-                if (moveIntervalMs <= 0f) break; // avoid an infinite loop if moveIntervalMs is set to 0
+                if (physicsIntervalMs <= 0f) break; // avoid an infinite loop if physicsIntervalMs is set to 0
             }
 
             // ApplyToWorld is only called when the voxel actually moves rather than every frame
@@ -94,8 +96,7 @@ namespace NAADF.World.Data
             Vector3 camDir = WorldRender.camera.GetDir();
             Point3 spawn = Point3.FromVector3(camPos + camDir * 20f);
 
-            // The check is done on the spawn point and the farthest point along the path, which is RangeSteps away in the +X direction.
-            if (!fluidGrid.IsInside(spawn) || !fluidGrid.IsInside(spawn + new Point3(RangeSteps, 0, 0)))
+            if (!fluidGrid.IsInside(spawn))
             {
                 Console.WriteLine("FluidHandler: spawn point is outside the world, aim somewhere else and press G again.");
                 return;
@@ -109,11 +110,9 @@ namespace NAADF.World.Data
                 dirtyCells.Add(currentCell);
             }
 
-            originCell = spawn;
             currentCell = spawn;
-            travel = 0;
-            stepDir = 1;
-            moveAccumulatorMs = 0f;
+            currentPosition = spawn.ToVector3();
+            physicsAccumulatorMs = 0f;
             hasCell = true;
             fluidGrid.SetFluid(currentCell, true);
             dirtyCells.Add(currentCell);
@@ -122,23 +121,35 @@ namespace NAADF.World.Data
             Console.WriteLine($"FluidHandler: spawned voxel at ({spawn.X}, {spawn.Y}, {spawn.Z}).");
         }
 
-        // To decide where the voxel goes next. No engine interaction here on purpose.
-        // Will do more complex fluid simulation math later, but for now it just moves back and forth along the X axis.
-        // Updates fluidGrid directly so the grid is always the source of truth for what's fluid.
-        private void StepSimulation()
+        // Integrates gravity into the cell's velocity, then integrates velocity into its continuous position. 
+        // Once the continuous position crosses into a neighboring voxel, the grid entry moves there too. 
+        // fluidGrid stays the source of truth for both fluid state and velocity. No collision checks yet
+        private void StepPhysics(float dt)
         {
-            Point3 previousCell = currentCell;
+            Vector3 velocity = fluidGrid.GetVelocity(currentCell);
+            velocity += gravity * dt;
 
-            travel += stepDir;
-            if (travel >= RangeSteps || travel <= 0)
-                stepDir = -stepDir; // bounce at either end so the voxel stays near the spawn point
+            Vector3 newPosition = currentPosition + velocity * dt;
+            Point3 newCell = Point3.FromVector3(newPosition);
 
-            currentCell = originCell + new Point3(travel, 0, 0);
+            if (!fluidGrid.IsInside(newCell))
+            {
+                newPosition = currentCell.ToVector3();
+                newCell = currentCell;
+                velocity = Vector3.Zero;
+            }
 
-            fluidGrid.SetFluid(previousCell, false);
-            fluidGrid.SetFluid(currentCell, true);
-            dirtyCells.Add(previousCell);
-            dirtyCells.Add(currentCell);
+            if (!newCell.Equals(currentCell))
+            {
+                fluidGrid.SetFluid(currentCell, false);
+                dirtyCells.Add(currentCell);
+                currentCell = newCell;
+                fluidGrid.SetFluid(currentCell, true);
+                dirtyCells.Add(currentCell);
+            }
+
+            currentPosition = newPosition;
+            fluidGrid.SetVelocity(currentCell, velocity);
         }
 
         // Display/apply step: re-draws every cell whose fluid state changed since the last apply, then
