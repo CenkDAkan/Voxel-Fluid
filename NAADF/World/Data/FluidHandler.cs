@@ -255,7 +255,7 @@ namespace NAADF.World.Data
                 return;
             }
 
-            if (fluidGrid.IsFluid(cell))
+            if (fluidGrid.IsFluid(cell) || worldData.IsVoxelSolid(cell))
                 return;
 
             particles.Add(new Particle { currentCell = cell, currentPosition = cell.ToVector3() });
@@ -268,29 +268,51 @@ namespace NAADF.World.Data
         }
 
         // Integrates gravity into each particle's velocity, then integrates velocity into its continuous position
-        // Once a particle's continuous position crosses into a neighboring voxel, its grid entry moves there too
-        // fluidGrid stays the source of truth for both fluid state and velocity. No collision checks yet
+        // With collision resolution, see StepParticle. Once a particle's continuous position crosses into a neighboring voxel, 
+        // its grid entry moves there too. fluidGrid stays the source of truth for both fluid state and velocity. 
+        // Fluid-fluid collision isn't handled yet, if two particles' paths land in the same cell, the later write just wins
         private void StepPhysics(float dt)
         {
             foreach (Particle particle in particles)
                 StepParticle(particle, dt);
         }
 
-        private void StepParticle(Particle particle, float dt)
+        private void StepParticle(Particle particle, float dt) // dt stands for delta time in seconds, not milliseconds
         {
             Vector3 velocity = fluidGrid.GetVelocity(particle.currentCell);
             velocity += gravity * dt;
 
-            Vector3 newPosition = particle.currentPosition + velocity * dt;
-            Point3 newCell = Point3.FromVector3(newPosition);
+            // Resolve collision one axis at a time against a running position, rather than testing the combined
+            // destination in one shot. This lets a particle blocked on one axis keep moving on the others,
+            // like sliding along a wall/floor, and it prevents a diagonal move from cutting through a solid corner
+            // that neither pure-axis move would itself enter. Each axis step tests against the previous axes' 
+            // already-resolved position, so the final cell always ends up checked by the time all three are done. 
+            // World bounds are folded into the same per-axis check, so sliding along the world edge behaves
+            // the same as sliding along solid geometry.
+            Vector3 resolvedPosition = particle.currentPosition;
 
-            if (!fluidGrid.IsInside(newCell))
-            {
-                newPosition = particle.currentCell.ToVector3();
-                newCell = particle.currentCell;
-                velocity = Vector3.Zero;
-            }
+            Vector3 candidate = resolvedPosition;
+            candidate.X += velocity.X * dt;
+            if (IsBlocked(Point3.FromVector3(candidate)))
+                velocity.X = 0f;
+            else
+                resolvedPosition.X = candidate.X;
 
+            candidate = resolvedPosition;
+            candidate.Y += velocity.Y * dt;
+            if (IsBlocked(Point3.FromVector3(candidate)))
+                velocity.Y = 0f;
+            else
+                resolvedPosition.Y = candidate.Y;
+
+            candidate = resolvedPosition;
+            candidate.Z += velocity.Z * dt;
+            if (IsBlocked(Point3.FromVector3(candidate)))
+                velocity.Z = 0f;
+            else
+                resolvedPosition.Z = candidate.Z;
+
+            Point3 newCell = Point3.FromVector3(resolvedPosition);
             if (!newCell.Equals(particle.currentCell))
             {
                 fluidGrid.SetFluid(particle.currentCell, false);
@@ -300,8 +322,25 @@ namespace NAADF.World.Data
                 dirtyCells.Add(particle.currentCell);
             }
 
-            particle.currentPosition = newPosition;
+            particle.currentPosition = resolvedPosition;
             fluidGrid.SetVelocity(particle.currentCell, velocity);
+        }
+
+        // A cell blocks fluid movement if it's outside the addressable world, or occupied by solid world
+        // geometry that isn't itself fluid. The fluidGrid check matters because fluid voxels are drawn through the
+        // same shared world data as real terrain and use the same "solid" render bit like in the original grid, so
+        // without excluding fluid cells here a particle would read its own just-flushed position as solid
+        // terrain and immediately collide with itself. fluidGrid reflects live simulation state, which is updated the
+        // instant a particle moves, so it's the correct source of truth for "is this actually fluid"
+        // WorldData's voxel data only catches up once ApplyToWorld flushes.
+        // This was a fix to a bug where a particle would collide with itself and stop moving if it was the only particle in a cell
+        private bool IsBlocked(Point3 cell)
+        {
+            if (!fluidGrid.IsInside(cell))
+                return true;
+            if (fluidGrid.IsFluid(cell))
+                return false;
+            return worldData.IsVoxelSolid(cell);
         }
 
         // Display/apply step: re-draws every cell whose fluid state changed since the last apply, then

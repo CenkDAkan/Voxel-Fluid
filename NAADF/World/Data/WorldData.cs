@@ -490,6 +490,37 @@ namespace NAADF.World.Data
             return resultType;
         }
 
+        // Point query for whether a single world voxel is solid
+        // Walks the same chunk/block/voxel node tree as RayTraversal but for one position, reading dataChunk/dataBlock/dataVoxel directly
+        // Deliberately bypasses the editData staging pipeline (getChunkDataToEdit/setVoxelData) since this is read-only 
+        // and needs to be cheap to call every physics tick per fluid particle
+        // assumed worldVoxel is within sizeInVoxels as out-of-range positions are not checked here
+        public bool IsVoxelSolid(Point3 worldVoxel)
+        {
+            Point3 voxelPosInChunk = worldVoxel % 16;
+            Point3 chunkPos = worldVoxel / 16;
+            int chunkIndex = chunkPos.X + chunkPos.Y * sizeInChunks.X + chunkPos.Z * sizeInChunks.X * sizeInChunks.Y;
+            uint curNode = dataChunk[chunkIndex];
+
+            if ((curNode >> 31) != 0) // pointer to blocks
+            {
+                Point3 blockPosInChunk = voxelPosInChunk / 4;
+                int blockIndex = (int)(curNode & 0x3FFFFFFF) + blockPosInChunk.X + blockPosInChunk.Y * 4 + blockPosInChunk.Z * 16;
+                curNode = dataBlock[blockIndex];
+
+                if ((curNode >> 31) != 0) // pointer to voxels
+                {
+                    Point3 voxelPosInBlock = worldVoxel % 4;
+                    int voxelIndex = (int)(curNode & 0x3FFFFFFF) * 2 + voxelPosInBlock.X + voxelPosInBlock.Y * 4 + voxelPosInBlock.Z * 16;
+                    uint voxelPair = dataVoxel[voxelIndex / 2];
+                    uint voxel = (voxelPair >> (16 * (voxelIndex & 0x1))) & 0xFFFF;
+                    return (voxel & 0x8000) != 0; // bit 15 = solid flag
+                }
+            }
+
+            return (curNode & 0x40000000) != 0; // bit 30 set = uniform solid type (chunk/block-level)
+        }
+
         public void setEffect(Effect effect)
         {
             effect.Parameters["boundingBoxMin"].SetValue(new Vector3(+0.1f));
