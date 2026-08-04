@@ -244,27 +244,92 @@ namespace NAADF.World.Data
             worldData.editingHandler.processChunks(false);
         }
 
-        // Adds one new fluid particle at cell with the given initial velocity 
+        // Writes air over a marker voxel placed by PlaceMarkerVoxel, same bypass-fluidGrid direct write, used by
+        // ClearAll to remove a sprinkler's base when this handler's mode is deselected
+        private void EraseMarkerVoxel(Point3 worldVoxel)
+        {
+            Point3 chunkPos = worldVoxel / 16;
+            Point3 voxelPosInChunk = worldVoxel % 16;
+
+            uint pointer = worldData.editingHandler.getChunkDataToEdit(chunkPos);
+            worldData.editingHandler.setVoxelData(pointer, voxelPosInChunk, 0u);
+        }
+
+        // Adds one new fluid particle at cell with the given initial velocity
         // (the "impulse" is zero for a plain dropped voxel, camDir * hoseSpeed for the hose)
         // Skips cells already marked fluid rather than merging into them
         private void SpawnParticle(Point3 cell, Vector3 initialVelocity)
         {
+            if (!AddParticle(cell, initialVelocity))
+                return;
+
+            ApplyToWorld(); // make the freshly spawned voxel appear immediately
+        }
+
+        // The actual "add one particle" logic, split out of SpawnParticle so a batch seed (SeedBlock) can add many
+        // without paying for an ApplyToWorld flush after every single one
+        private bool AddParticle(Point3 cell, Vector3 initialVelocity)
+        {
             if (!fluidGrid.IsInside(cell))
             {
                 Console.WriteLine("FluidHandler: spawn point is outside the world, aim somewhere else.");
-                return;
+                return false;
             }
 
             if (fluidGrid.IsFluid(cell) || worldData.IsVoxelSolid(cell))
-                return;
+                return false;
 
             particles.Add(new Particle { currentCell = cell, currentPosition = cell.ToVector3() });
 
             fluidGrid.SetFluid(cell, true);
             fluidGrid.SetVelocity(cell, initialVelocity);
             dirtyCells.Add(cell);
+            return true;
+        }
 
-            ApplyToWorld(); // make the freshly spawned voxel appear immediately
+        // Drops a cube block of particles at once with zero initial velocity, applying once at the end rather than
+        // per-particle. This is the sparse side's equivalent of DenseFluidHandler.SeedBlob - same cube dimensions,
+        // so the two approaches start from a directly comparable amount of fluid when a benchmark mode is selected.
+        private void SeedBlock(Point3 originCell, int radius)
+        {
+            for (int x = -radius; x <= radius; x++)
+                for (int y = -radius; y <= radius; y++)
+                    for (int z = -radius; z <= radius; z++)
+                        AddParticle(originCell + new Point3(x, y, z), Vector3.Zero);
+
+            ApplyToWorld();
+        }
+
+        // Called once when this mode is selected from Settings (WorldData.ApplyFluidSimulationMode) instead of
+        // waiting for a manual G press, so switching modes always starts from the same reproducible scenario.
+        // Manual G/H/J controls still work afterward for interactive poking on top of this.
+        public void SeedDefaultScenario()
+        {
+            Vector3 camPos = WorldRender.camera.GetPos().toVector3();
+            Vector3 camDir = WorldRender.camera.GetDir();
+            Point3 origin = Point3.FromVector3(camPos + camDir * 20f);
+
+            SeedBlock(origin, 4);
+        }
+
+        // Erases every particle and sprinkler this handler has drawn back to air, and drops all simulation state
+        // called by WorldData.ApplyFluidSimulationMode before switching away from this mode, so leftover fluid
+        // voxels don't linger as ordinary solid terrain once this handler stops being updated.
+        public void ClearAll()
+        {
+            foreach (Particle particle in particles)
+            {
+                fluidGrid.SetFluid(particle.currentCell, false);
+                WriteCell(particle.currentCell);
+            }
+            particles.Clear();
+            dirtyCells.Clear();
+
+            foreach (Sprinkler sprinkler in sprinklers)
+                EraseMarkerVoxel(sprinkler.position);
+            sprinklers.Clear();
+
+            worldData.editingHandler.processChunks(false);
         }
 
         // Integrates gravity into each particle's velocity, then integrates velocity into its continuous position
@@ -291,7 +356,7 @@ namespace NAADF.World.Data
             // the same as sliding along solid geometry.
             Vector3 resolvedPosition = particle.currentPosition;
 
-            Vector3 candidate = resolvedPosition;
+            Vector3 candidate = resolvedPosition; // TO DO: check for speedy fluid voxels, maybe ray casting? might not be needed later
             candidate.X += velocity.X * dt;
             if (IsBlocked(Point3.FromVector3(candidate)))
                 velocity.X = 0f;
@@ -313,7 +378,7 @@ namespace NAADF.World.Data
                 resolvedPosition.Z = candidate.Z;
 
             Point3 newCell = Point3.FromVector3(resolvedPosition);
-            if (!newCell.Equals(particle.currentCell))
+            if (!newCell.Equals(particle.currentCell)) 
             {
                 fluidGrid.SetFluid(particle.currentCell, false);
                 dirtyCells.Add(particle.currentCell);

@@ -1,9 +1,11 @@
-﻿using NAADF.Common;
+﻿using Microsoft.Xna.Framework;
+using NAADF.Common;
 using NAADF.Gui;
 using NAADF.World.Data;
 using NAADF.World.Generator;
 using NAADF.World.Model;
 using NAADF.World.Render;
+using System;
 using System.IO;
 
 namespace NAADF.World
@@ -17,6 +19,8 @@ namespace NAADF.World
         public ModelHandler modelHandler;
         public int worldGenSegmentSizeInGroups = 4; // A group is 4^3 chunks or 64^3 voxels
         public Point3 worldSizeToUseInWorldGenSegments = new Point3(16, 2, 16);
+        private uint testFloorTypeRenderIndex;
+        private bool testFloorTypeRegistered = false;
 
         public WorldHandler()
         {
@@ -59,6 +63,77 @@ namespace NAADF.World
             worldData?.Dispose();
             worldData = newWorldData;
             worldData.GenerateWorld(generator);
+        }
+
+        // Fixed world-voxel position of the flat test floor's top surface
+        // Repeated "Load flat test scene" presses always rebuild the exact same floor in the exact same place
+        private static readonly Point3 flatSceneAnchor = new Point3(2048, 200, 2048);
+
+        // Regenerates the world as fully empty (WorldGeneratorEmpty) and carves a flat solid floor at the fixed flatSceneAnchor, 
+        // so fluid comparison testing has a clean, level, reproducible surface
+        // Resets fluid mode to None first. GenerateWorld wipes every voxel including whatever a fluid handler had drawn, 
+        // and neither handler would otherwise know its own tracked state (particles/grid) is now stale
+        // Also moves the camera to a fixed vantage point above the anchor
+        public void LoadFlatFluidTestScene()
+        {
+            worldData.ApplyFluidSimulationMode(FluidSimulationMode.None);
+            worldData.GenerateWorld(new WorldGeneratorEmpty());
+            BuildFlatTestFloor();
+
+            WorldRender.camera.SetPos(new Vector3(flatSceneAnchor.X, flatSceneAnchor.Y + 40, flatSceneAnchor.Z));
+            WorldRender.camera.SetDir(Vector3.UnitZ);
+        }
+
+        // Goes back to the default oasis scene
+        public void LoadOasisScene()
+        {
+            worldData.ApplyFluidSimulationMode(FluidSimulationMode.None);
+            LoadModelScene("Content\\oasis.cvox");
+
+            WorldRender.camera.SetPos(new Vector3(500, 200, 40));
+        }
+
+        // Fills a flat slab of ordinary solid ground centered on flatSceneAnchor
+        // Same getChunkDataToEdit/setVoxelData/processChunks path the fluid handlers and editing tools already use
+        private void BuildFlatTestFloor()
+        {
+            if (!testFloorTypeRegistered)
+            {
+                VoxelType testFloorType = new VoxelType
+                {
+                    ID = "fluid_test_floor",
+                    colorBase = new Vector3(0.6f, 0.6f, 0.6f),
+                    colorLayered = Vector3.Zero,
+                    materialBase = MaterialTypeBase.Diffuse,
+                    materialLayer = MaterialTypeLayer.None,
+                    roughness = 0.8f,
+                };
+                testFloorTypeRenderIndex = voxelTypeHandler.ApplyVoxelType(testFloorType).renderIndex;
+                testFloorTypeRegistered = true;
+            }
+
+            const int halfExtent = 64; // 128x128 pad, comfortably covers a 24-64 voxel fluid domain placed nearby
+            const int floorThickness = 4;
+
+            int minX = Math.Clamp(flatSceneAnchor.X - halfExtent, 0, worldData.sizeInVoxels.X - 1);
+            int maxX = Math.Clamp(flatSceneAnchor.X + halfExtent, 0, worldData.sizeInVoxels.X - 1);
+            int minZ = Math.Clamp(flatSceneAnchor.Z - halfExtent, 0, worldData.sizeInVoxels.Z - 1);
+            int maxZ = Math.Clamp(flatSceneAnchor.Z + halfExtent, 0, worldData.sizeInVoxels.Z - 1);
+            int floorTopY = Math.Clamp(flatSceneAnchor.Y, floorThickness, worldData.sizeInVoxels.Y - 1);
+
+            for (int x = minX; x <= maxX; x++)
+                for (int z = minZ; z <= maxZ; z++)
+                    for (int y = floorTopY - floorThickness + 1; y <= floorTopY; y++)
+                    {
+                        Point3 worldVoxel = new Point3(x, y, z);
+                        Point3 chunkPos = worldVoxel / 16;
+                        Point3 voxelPosInChunk = worldVoxel % 16;
+
+                        uint pointer = worldData.editingHandler.getChunkDataToEdit(chunkPos);
+                        worldData.editingHandler.setVoxelData(pointer, voxelPosInChunk, (1u << 15) | testFloorTypeRenderIndex);
+                    }
+
+            worldData.editingHandler.processChunks(false);
         }
 
         public void ScreenUpdate()

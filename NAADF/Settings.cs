@@ -10,6 +10,7 @@
 
 using ImGuiNET;
 using NAADF.Gui;
+using NAADF.World.Data;
 using NAADF.World.Render;
 using System;
 using System.IO;
@@ -85,10 +86,58 @@ namespace NAADF
         }
     }
 
+    // Selects which fluid comparison approach is live, letting benchmarking/testing switch between them on the fly instead of needing a rebuild per approach
+    public class SettingDataFluid
+    {
+        public FluidSimulationMode mode = FluidSimulationMode.None;
+
+        public void RenderImGui()
+        {
+            if (ImGui.Button("Load flat test scene"))
+            {
+                App.worldHandler.LoadFlatFluidTestScene(); // resets the world's own activeFluidMode to None internally
+                mode = FluidSimulationMode.None;            // keep this combo's displayed selection in sync with that reset
+            }
+            ImGuiCommon.HelperIcon("Regenerates the world as empty and carves a flat floor at a fixed world position, so fluid testing isn't confounded by oasis.cvox's uneven terrain. Also resets the fluid mode below to None.", 500);
+
+            ImGui.SameLine();
+            if (ImGui.Button("Load oasis scene"))
+            {
+                App.worldHandler.LoadOasisScene();
+                mode = FluidSimulationMode.None;
+            }
+            ImGuiCommon.HelperIcon("Reloads the original oasis.cvox terrain and resets the fluid mode below to None.", 500);
+
+            if (ImGui.BeginCombo("Fluid simulation", mode.ToString()))
+            {
+                foreach (FluidSimulationMode curMode in Enum.GetValues(typeof(FluidSimulationMode)))
+                {
+                    bool isSelected = mode == curMode;
+                    if (ImGui.Selectable(curMode.ToString(), isSelected))
+                    {
+                        mode = curMode;
+                        App.worldHandler.worldData.ApplyFluidSimulationMode(mode);
+                    }
+                    if (isSelected)
+                        ImGui.SetItemDefaultFocus();
+                }
+                ImGui.EndCombo();
+            }
+            ImGuiCommon.HelperIcon("Switches the fluid comparison approach in use. Clears whatever the previous approach drew and seeds the new one with a fixed starting scenario.", 500);
+
+            if (mode == FluidSimulationMode.DenseEulerian)
+            {
+                ImGui.Checkbox("Enable dense gravity", ref App.worldHandler.worldData.denseFluidHandler.enableGravity);
+                ImGuiCommon.HelperIcon("Off by default: a freshly placed domain starts suspended so diffusion's spreading effect can be checked in isolation, without racing the still-unimplemented floor-resting behavior at low framerates. Check this to let it fall.", 500);
+            }
+        }
+    }
+
     public class SettingData
     {
         public SettingDataGeneral general = new();
         public SettingDataRender render = new();
+        public SettingDataFluid fluid = new();
 
         public void RenderImGui()
         {
@@ -109,6 +158,11 @@ namespace NAADF
                 if (ImGui.BeginTabItem("General"))
                 {
                     general.RenderImGui();
+                    ImGui.EndTabItem();
+                }
+                if (ImGui.BeginTabItem("Fluid"))
+                {
+                    fluid.RenderImGui();
                     ImGui.EndTabItem();
                 }
 

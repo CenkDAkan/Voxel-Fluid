@@ -16,6 +16,12 @@ using System.Threading;
 
 namespace NAADF.World.Data
 {
+    public enum FluidSimulationMode
+    {
+        None,
+        SparseParticles,
+        DenseEulerian,
+    }
 
     public class WorldData : IDisposable
     {
@@ -46,6 +52,8 @@ namespace NAADF.World.Data
         public ChangeHandler changeHandler;
         public EditingHandler editingHandler;
         public FluidHandler fluidHandler;
+        public DenseFluidHandler denseFluidHandler;
+        public FluidSimulationMode activeFluidMode = FluidSimulationMode.None;
 
         private const int GPU_MAX_ELEMENTS_UINT = 1024 * 1024 * 511;
         private static Effect chunkProcessor;
@@ -95,6 +103,7 @@ namespace NAADF.World.Data
             entityHandler = new EntityHandler(this);
             editingHandler = new EditingHandler(this);
             fluidHandler = new FluidHandler(this);
+            denseFluidHandler = new DenseFluidHandler(this);
             blockHashingHandler = new BlockHashingHandler(this, 0, 0.5f, (worldGenSegmentSizeInVoxels * worldGenSegmentSizeInVoxels * worldGenSegmentSizeInVoxels) / 64);
         }
 
@@ -119,9 +128,30 @@ namespace NAADF.World.Data
 
             entityHandler.Update(gameTime, WorldRender.render.taaIndex);
             editingHandler.Update(gameTime);
-            fluidHandler.Update(gameTime);
+            if (activeFluidMode == FluidSimulationMode.SparseParticles)
+                fluidHandler.Update(gameTime);
+            else if (activeFluidMode == FluidSimulationMode.DenseEulerian)
+                denseFluidHandler.Update(gameTime);
             changeHandler.Update();
             boundHandler.Update();
+        }
+
+        // Switches which fluid approach is live, called from Settings when the "Fluid simulation" combo changes
+        // Clears whatever the previously active mode had drawn, then seeds the newly selected one with a fixed
+        // scenario, so a mode switch always starts benchmarking from the same clean state
+        public void ApplyFluidSimulationMode(FluidSimulationMode mode)
+        {
+            if (activeFluidMode == FluidSimulationMode.SparseParticles)
+                fluidHandler.ClearAll();
+            else if (activeFluidMode == FluidSimulationMode.DenseEulerian)
+                denseFluidHandler.ClearAll();
+
+            activeFluidMode = mode;
+
+            if (mode == FluidSimulationMode.SparseParticles)
+                fluidHandler.SeedDefaultScenario();
+            else if (mode == FluidSimulationMode.DenseEulerian)
+                denseFluidHandler.SeedDefaultScenario();
         }
 
         // Builds the entire world on the GPU one worldGen segment at a time, then pulls the resulting
