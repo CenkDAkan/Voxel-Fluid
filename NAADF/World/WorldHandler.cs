@@ -65,20 +65,12 @@ namespace NAADF.World
             worldData.GenerateWorld(generator);
         }
 
-        // Fixed world-voxel position of the flat test floor's top surface
-        // Repeated "Load flat test scene" presses always rebuild the exact same floor in the exact same place
         private static readonly Point3 flatSceneAnchor = new Point3(2048, 200, 2048);
 
-        // Regenerates the world as fully empty (WorldGeneratorEmpty) and carves a flat solid floor at the fixed flatSceneAnchor, 
-        // so fluid comparison testing has a clean, level, reproducible surface
-        // Resets fluid mode to None first. GenerateWorld wipes every voxel including whatever a fluid handler had drawn, 
-        // and neither handler would otherwise know its own tracked state (particles/grid) is now stale
-        // Also moves the camera to a fixed vantage point above the anchor
-        public void LoadFlatFluidTestScene()
+        public void LoadEmptyTestScene()
         {
             worldData.ApplyFluidSimulationMode(FluidSimulationMode.None);
             worldData.GenerateWorld(new WorldGeneratorEmpty());
-            BuildFlatTestFloor();
 
             WorldRender.camera.SetPos(new Vector3(flatSceneAnchor.X, flatSceneAnchor.Y + 40, flatSceneAnchor.Z));
             WorldRender.camera.SetDir(Vector3.UnitZ);
@@ -93,9 +85,7 @@ namespace NAADF.World
             WorldRender.camera.SetPos(new Vector3(500, 200, 40));
         }
 
-        // Fills a flat slab of ordinary solid ground centered on flatSceneAnchor
-        // Same getChunkDataToEdit/setVoxelData/processChunks path the fluid handlers and editing tools already use
-        private void BuildFlatTestFloor()
+        public void BuildFlatTestFloor()
         {
             if (!testFloorTypeRegistered)
             {

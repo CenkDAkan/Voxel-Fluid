@@ -45,6 +45,10 @@ namespace NAADF.World.Data
         public Point3 WorldToLocal(Point3 worldVoxel) => worldVoxel - origin;
         public Point3 LocalToWorld(Point3 local) => local + origin;
 
+        // Direct references to the backing arrays
+        public float[] DensityArray => density;
+        public Vector3[] VelocityArray => velocity;
+
         public Vector3 GetVelocity(Point3 local) => IsInsideLocal(local) ? velocity[Index(local)] : Vector3.Zero;
 
         public void SetVelocity(Point3 local, Vector3 value)

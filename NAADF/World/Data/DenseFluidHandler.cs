@@ -1,9 +1,11 @@
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using NAADF.Common;
 using NAADF.Gui;
 using NAADF.World.Render;
 using System;
+using System.Threading.Tasks;
 
 namespace NAADF.World.Data
 {
@@ -12,45 +14,49 @@ namespace NAADF.World.Data
     * sparse particle system. A fixed-size velocity+density field is advanced by external forces, advection, diffusion, and pressure projection
     * every tick, over every cell in a bounded domain, regardless of how much of that domain is actually fluid
     * Diffusion is applied to both velocity and density, matching the masters thesis's implementation
+    *
+    * The physics pipeline (forces/advect/diffuse/project/renormalize) runs entirely on GPU via denseFluidSim.fx, 
+    * mirroring the CPU version's own ping-pong swap points buffer-for-buffer
+    * `grid` is kept only as a CPU-side mirror, its density array is refreshed from the GPU once per Update call (via GetData) 
+    * so ApplyToWorld/WriteCell can keep working completely unchanged
     */
     public class DenseFluidHandler
     {
         private WorldData worldData;
+        private Effect fluidEffect;
 
-        // Both share size/origin once placed. grid is the current field, scratch is the buffer whichever step is
-        // running writes its result into before swapping, which is reused by both Advect and Diffuse rather than reallocated
+        // CPU-side mirror of density, synced from the GPU buffers below after each Update call that stepped physics
         private DenseFluidGrid grid;
-        private DenseFluidGrid scratch;
 
         private uint fluidTypeRenderIndex;
 
-        // Cached per-cell "was this drawn as fluid last apply" state, indexed the same way as the grid itself, 
+        // Cached per-cell "was this drawn as fluid last apply" state, indexed the same way as the grid itself,
         // so ApplyToWorld only re-writes cells whose visible state actually flipped instead of the whole domain
         private bool[] wasVisible;
 
-        // Cached per-cell IsBlockedWorld result, recomputed once per Update call rather than re-derived on every lookup
-        private bool[] blocked;
+        // Cached per-cell IsBlockedWorld result, recomputed once per Update call rather than re-derived on every
+        // lookup, and uploaded to the GPU (blockedBuffer) each time it changes
+        // uint (0/1) rather than bool[] because that's what maps onto a StructuredBuffer<uint> on the shader side
+        private uint[] blocked;
 
-        // Pressure field for projection. Kept as its own pair of flat arrays rather than living on DenseFluidGrid
-        // Unlike density/velocity, pressure is never advected or sampled at continuous positions, only read/written 
-        // by integer-indexed neighbor lookups within Project, so it doesn't need DenseFluidGrid's trilinear-sampling machinery
-        // Divergence is fully recomputed each tick before the solve
-        private float[] pressure;
-        private float[] pressureScratch;
-        private float[] divergence;
+        private int cellCount;
 
-        // Fixed right-hand side ("b" in thesis Eq 3.13) for Diffuse's Jacobi solve
-        private float[] diffuseSourceDensity;
-        private Vector3[] diffuseSourceVelocity;
+        // GPU buffers. Ping-pong pairs (velocity/velocityScratch, density/densityScratch, pressure/pressureScratch)
+        // are swapped by reassigning these C# references after each dispatch that writes to the scratch side
+        private StructuredBuffer velocityBuffer;
+        private StructuredBuffer velocityScratchBuffer;
+        private StructuredBuffer densityBuffer;
+        private StructuredBuffer densityScratchBuffer;
+        private StructuredBuffer pressureBuffer;
+        private StructuredBuffer pressureScratchBuffer;
+        private StructuredBuffer divergenceBuffer;
+        private StructuredBuffer diffuseSourceDensityBuffer;
+        private StructuredBuffer diffuseSourceVelocityBuffer;
+        private StructuredBuffer blockedBuffer;
+        private StructuredBuffer densityPartialSumsBuffer; // one slot per Z slice, for RenormalizeDensity's mass sum
 
-        // The 6 face-neighbor offsets, shared by every full-domain sweep that needs them (Diffuse's neighbor sums)
-        // A single static array instead of allocating a fresh one per cell per iteration
-        private static readonly Point3[] neighborOffsets =
-        {
-            new Point3(1, 0, 0), new Point3(-1, 0, 0),
-            new Point3(0, 1, 0), new Point3(0, -1, 0),
-            new Point3(0, 0, 1), new Point3(0, 0, -1),
-        };
+        private float[] densityPartialSumsCpu;
+        private Vector4[] velocityLogScratch;
 
         // Same magnitude as FluidHandler's gravity so the two are physically comparable, not just algorithmically
         private Vector3 gravity = new Vector3(0f, -20f, 0f);
@@ -58,7 +64,7 @@ namespace NAADF.World.Data
         public bool enableGravity = false;
 
         // How fast density/velocity spread into neighboring cells per second
-        private float diffusionRate = 0.01f;
+        private float diffusionRate = 0.1f;
 
         private const int diffusionIterations = 30;
 
@@ -70,16 +76,19 @@ namespace NAADF.World.Data
 
         private float massLogAccumulatorMs = 0f;
 
-        // If a single StepPhysics call ever takes longer than physicsIntervalMs, the accumulator falls further behind every frame, 
+        // If a single StepPhysics call ever takes longer than physicsIntervalMs, the accumulator falls further behind every frame,
         // so the catch-up while loop below runs more and more iterations per frame
         private const int maxPhysicsStepsPerFrame = 4;
 
         // Density at or above this is drawn as solid fluid, below is empty/air
         private float visibilityThreshold = 0.5f;
+        public int domainSize = 24;
 
         public DenseFluidHandler(WorldData worldData)
         {
             this.worldData = worldData;
+
+            fluidEffect = App.contentManager.Load<Effect>("shaders/fluid/denseFluidSim");
 
             VoxelType denseFluidType = new VoxelType
             {
@@ -101,6 +110,7 @@ namespace NAADF.World.Data
                 return;
 
             RecomputeBlockedCache();
+            blockedBuffer.SetData(blocked);
 
             LogTotalMass(gameTime);
 
@@ -119,7 +129,12 @@ namespace NAADF.World.Data
                 physicsAccumulatorMs = 0f; // drop the backlog rather than let it compound into next frame's catch-up
 
             if (stepped)
+            {
+                // Only density needs to come back. ApplyToWorld only ever reads GetDensity, never velocity
+                // GetData writes directly into grid's backing array and DensityArray returns the live reference
+                densityBuffer.GetData(grid.DensityArray);
                 ApplyToWorld();
+            }
         }
         // K places the domain manually, anchored in front of the camera the same way the sprinkler (J) places its marker
         private void HandlePlaceInput()
@@ -138,8 +153,7 @@ namespace NAADF.World.Data
             Vector3 camPos = WorldRender.camera.GetPos().toVector3();
             Vector3 camDir = WorldRender.camera.GetDir();
 
-            // Tried 64^3 first, even that was enough to make the engine struggle. The thesis's 120^3 seems out of reach for now
-            Point3 domainSize = new Point3(24, 24, 24);
+            Point3 domainDims = new Point3(domainSize, domainSize, domainSize);
 
             Vector3 aimPoint = camPos + camDir * 20f;
             Point3 domainXZCenter = Point3.FromVector3(aimPoint);
@@ -147,23 +161,56 @@ namespace NAADF.World.Data
             uint hitType = worldData.RayTraversal(aimPoint + new Vector3(0, 200, 0), new Vector3(0, -1, 0), out float hitLength, out Point3 hitVoxel, out Point3 hitNormal);
             int domainBottomY = hitType != 0 ? hitVoxel.Y + 1 : (int)aimPoint.Y - 40; // fallback if the ray finds nothing
 
-            Point3 origin = new Point3(domainXZCenter.X - domainSize.X / 2, domainBottomY, domainXZCenter.Z - domainSize.Z / 2);
+            Point3 origin = new Point3(domainXZCenter.X - domainDims.X / 2, domainBottomY, domainXZCenter.Z - domainDims.Z / 2);
 
-            grid = new DenseFluidGrid(origin, domainSize);
-            scratch = new DenseFluidGrid(origin, domainSize);
-            wasVisible = new bool[domainSize.X * domainSize.Y * domainSize.Z];
-            blocked = new bool[domainSize.X * domainSize.Y * domainSize.Z];
-            pressure = new float[domainSize.X * domainSize.Y * domainSize.Z];
-            pressureScratch = new float[domainSize.X * domainSize.Y * domainSize.Z];
-            divergence = new float[domainSize.X * domainSize.Y * domainSize.Z];
-            diffuseSourceDensity = new float[domainSize.X * domainSize.Y * domainSize.Z];
-            diffuseSourceVelocity = new Vector3[domainSize.X * domainSize.Y * domainSize.Z];
+            grid = new DenseFluidGrid(origin, domainDims);
+            cellCount = domainDims.X * domainDims.Y * domainDims.Z;
+
+            wasVisible = new bool[cellCount];
+            blocked = new uint[cellCount];
+            densityPartialSumsCpu = new float[domainDims.Z];
+            velocityLogScratch = new Vector4[cellCount];
             massLogAccumulatorMs = 0f;
 
-            // Same cube radius as FluidHandler.SeedDefaultScenario's SeedBlock, so both modes start from a directly comparable amount of fluid
-            SeedBlob(new Point3(domainSize.X / 2, domainSize.Y * 3 / 4, domainSize.Z / 2), 4);
-            expectedTotalDensityMass = TotalDensityMass();
-            Console.WriteLine($"DenseFluidHandler: placed {domainSize.X}x{domainSize.Y}x{domainSize.Z} domain at world ({origin.X}, {origin.Y}, {origin.Z}).");
+            SeedBlob(new Point3(domainDims.X / 2, domainDims.Y * 3 / 4, domainDims.Z / 2), 4);
+
+            CreateGpuResources();
+
+            float initialMass = 0f;
+            foreach (float d in grid.DensityArray)
+                initialMass += d;
+            expectedTotalDensityMass = initialMass;
+
+            Console.WriteLine($"DenseFluidHandler: placed {domainDims.X}x{domainDims.Y}x{domainDims.Z} domain at world ({origin.X}, {origin.Y}, {origin.Z}).");
+        }
+
+        // Allocates every GPU buffer for the current domain, uploads the seeded density, 
+        // zero-initializes everything else, and sets the domain-size uniforms once
+        private void CreateGpuResources()
+        {
+            velocityBuffer = new StructuredBuffer(App.graphicsDevice, typeof(Vector4), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            velocityScratchBuffer = new StructuredBuffer(App.graphicsDevice, typeof(Vector4), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            densityBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            densityScratchBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            pressureBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            pressureScratchBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            divergenceBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            diffuseSourceDensityBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            diffuseSourceVelocityBuffer = new StructuredBuffer(App.graphicsDevice, typeof(Vector4), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            blockedBuffer = new StructuredBuffer(App.graphicsDevice, typeof(uint), cellCount, BufferUsage.None, ShaderAccess.Read);
+            densityPartialSumsBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), grid.size.Z, BufferUsage.None, ShaderAccess.ReadWrite);
+
+            velocityBuffer.SetData(new Vector4[cellCount]);
+            velocityScratchBuffer.SetData(new Vector4[cellCount]);
+            densityBuffer.SetData(grid.DensityArray); // seeded by SeedBlob just before this call
+            densityScratchBuffer.SetData(new float[cellCount]);
+            pressureBuffer.SetData(new float[cellCount]);
+            pressureScratchBuffer.SetData(new float[cellCount]);
+
+            fluidEffect.Parameters["sizeX"].SetValue((uint)grid.size.X);
+            fluidEffect.Parameters["sizeY"].SetValue((uint)grid.size.Y);
+            fluidEffect.Parameters["sizeZ"].SetValue((uint)grid.size.Z);
+            fluidEffect.Parameters["cellCount"].SetValue((uint)cellCount);
         }
 
         // Called once when this mode is selected from Settings (WorldData.ApplyFluidSimulationMode) instead of
@@ -182,9 +229,9 @@ namespace NAADF.World.Data
             if (grid == null)
                 return;
 
-            for (int x = 0; x < grid.size.X; x++)
+            for (int z = 0; z < grid.size.Z; z++)
                 for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
+                    for (int x = 0; x < grid.size.X; x++)
                     {
                         Point3 local = new Point3(x, y, z);
                         int idx = grid.Index(local);
@@ -194,33 +241,50 @@ namespace NAADF.World.Data
 
             worldData.editingHandler.processChunks(false);
 
+            DisposeGpuResources();
+
             grid = null;
-            scratch = null;
             wasVisible = null;
             blocked = null;
-            pressure = null;
-            pressureScratch = null;
-            divergence = null;
-            diffuseSourceDensity = null;
-            diffuseSourceVelocity = null;
+            densityPartialSumsCpu = null;
+            velocityLogScratch = null;
             physicsAccumulatorMs = 0f;
+        }
+
+        private void DisposeGpuResources()
+        {
+            velocityBuffer?.Dispose();
+            velocityScratchBuffer?.Dispose();
+            densityBuffer?.Dispose();
+            densityScratchBuffer?.Dispose();
+            pressureBuffer?.Dispose();
+            pressureScratchBuffer?.Dispose();
+            divergenceBuffer?.Dispose();
+            diffuseSourceDensityBuffer?.Dispose();
+            diffuseSourceVelocityBuffer?.Dispose();
+            blockedBuffer?.Dispose();
+            densityPartialSumsBuffer?.Dispose();
         }
 
         // Fills the blocked cache for the whole domain, see the field's comment for why this only needs to run
         // once per Update call rather than once per lookup.
         private void RecomputeBlockedCache()
         {
-            for (int x = 0; x < grid.size.X; x++)
+            Parallel.For(0, grid.size.Z, z =>
+            {
                 for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
+                    for (int x = 0; x < grid.size.X; x++)
                     {
                         Point3 cell = new Point3(x, y, z);
                         int idx = grid.Index(cell);
-                        blocked[idx] = IsBlockedWorld(grid.LocalToWorld(cell), idx);
+                        blocked[idx] = IsBlockedWorld(grid.LocalToWorld(cell), idx) ? 1u : 0u;
                     }
+            });
         }
 
         // Prints total density mass, total velocity magnitude, and the single highest per-cell density once a second
+        // Needs a GPU readback of both fields to do this, but only at this 1/sec throttle, so the cost is negligible
+        // Can be removed later, as it is not needed for simulation itself, but useful for debugging and future benchmarking
         private void LogTotalMass(float gameTime)
         {
             massLogAccumulatorMs += gameTime;
@@ -228,49 +292,27 @@ namespace NAADF.World.Data
                 return;
             massLogAccumulatorMs -= 1000f;
 
+            densityBuffer.GetData(grid.DensityArray);
+            velocityBuffer.GetData(velocityLogScratch);
+
             float totalSpeed = 0f;
             float peakDensity = 0f;
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                    {
-                        Point3 cell = new Point3(x, y, z);
-                        totalSpeed += grid.GetVelocity(cell).Length();
-                        peakDensity = Math.Max(peakDensity, grid.GetDensity(cell));
-                    }
+            float totalMass = 0f;
+            for (int i = 0; i < cellCount; i++)
+            {
+                Vector4 v = velocityLogScratch[i];
+                totalSpeed += new Vector3(v.X, v.Y, v.Z).Length();
+                float density = grid.DensityArray[i];
+                peakDensity = Math.Max(peakDensity, density);
+                totalMass += density;
+            }
 
-            Console.WriteLine($"DenseFluidHandler: total density mass = {TotalDensityMass():F3}, total speed = {totalSpeed:F3}, peak density = {peakDensity:F3}");
-        }
-
-        private float TotalDensityMass()
-        {
-            float total = 0f;
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                        total += grid.GetDensity(new Point3(x, y, z));
-            return total;
-        }
-
-        // Rescales every cell's density so the domain's total mass matches expectedTotalDensityMass which is captured once at seed time
-        private void RenormalizeDensity()
-        {
-            float currentTotal = TotalDensityMass();
-            if (currentTotal < 0.001f)
-                return; // nothing to rescale, and dividing by 0 would blow up
-
-            float scale = expectedTotalDensityMass / currentTotal;
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                    {
-                        Point3 cell = new Point3(x, y, z);
-                        grid.SetDensity(cell, grid.GetDensity(cell) * scale);
-                    }
+            Console.WriteLine($"DenseFluidHandler: total density mass = {totalMass:F3}, total speed = {totalSpeed:F3}, peak density = {peakDensity:F3}");
         }
 
         // Fills a small cube of local-space cells around center with density, giving advection an initial blob to
-        // carry instead of starting from an empty field
+        // carry instead of starting from an empty field. Writes into grid's CPU array directly - this only ever
+        // runs once, before CreateGpuResources uploads the result, so there's no GPU buffer to write through yet
         private void SeedBlob(Point3 center, int radius)
         {
             for (int x = -radius; x <= radius; x++)
@@ -279,290 +321,143 @@ namespace NAADF.World.Data
                         grid.SetDensity(center + new Point3(x, y, z), 1f);
         }
 
-        // Per-tick pipeline, in the thesis's own chapter order: external forces -> advection -> diffusion -> projection, 
-        // plus RenormalizeDensity at the end
+        // Per-tick pipeline, in the thesis's own chapter order: external forces -> advection -> diffusion -> projection,
+        // plus RenormalizeDensity at the end. Every step below is a GPU dispatch; nothing here reads back to CPU
+        // that only happens once, in Update, after this whole accumulator loop finishes for the frame
         private void StepPhysics(float dt)
         {
+            int groups = (cellCount + 63) / 64;
+
+            fluidEffect.Parameters["blocked"].SetValue(blockedBuffer);
+
             if (enableGravity)
-                ApplyExternalForces(dt);
-            Advect(dt);
-            Diffuse(dt);
-            Project();
-            RenormalizeDensity();
+                ApplyExternalForces(dt, groups);
+            Advect(dt, groups);
+            Diffuse(dt, groups);
+            Project(groups);
+            RenormalizeDensity(groups);
         }
 
         // u(t+dt) = u(t) + F*dt (thesis 3.10, same external forces term FluidHandler uses for gravity), applied
-        // to every cell in the domain regardless of whether it currently holds any fluid
-        // This full-domain sweep, vs FluidHandler's per-particle loop, is the dense side of the comparison
-        private void ApplyExternalForces(float dt)
+        // to every cell in the domain regardless of whether it currently holds any fluid, in place on velocity
+        // safe because gravity has no neighbor dependency (every thread only touches its own cell)
+        private void ApplyExternalForces(float dt, int groups)
         {
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                    {
-                        Point3 cell = new Point3(x, y, z);
-                        int idx = grid.Index(cell);
+            fluidEffect.Parameters["dt"].SetValue(dt);
+            fluidEffect.Parameters["gravity"].SetValue(gravity);
+            fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
 
-                        // Solid cells never accumulate velocity, because there's no fluid there to move
-                        if (blocked[idx])
-                            continue;
-
-                        grid.SetVelocity(cell, grid.GetVelocity(cell) + gravity * dt);
-                    }
+            fluidEffect.Techniques[0].Passes["ApplyExternalForces"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
         }
 
-        // For each cell, trace its center backward along the current velocity field to find where its contents came from this step, 
+        // For each cell, trace its center backward along the current velocity field to find where its contents came from this step,
         // then trilinearly sample that source position from the current (pre-advection) field
-        private void Advect(float dt)
+        // Writes to *Scratch (never in place) since a backtraced sample can land on any cell in the domain,
+        // including one another thread hasn't updated yet this dispatch, then swaps the C# buffer references
+        private void Advect(float dt, int groups)
         {
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                    {
-                        Point3 cell = new Point3(x, y, z);
-                        int idx = grid.Index(cell);
+            fluidEffect.Parameters["dt"].SetValue(dt);
+            fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
+            fluidEffect.Parameters["density"].SetValue(densityBuffer);
+            fluidEffect.Parameters["velocityScratch"].SetValue(velocityScratchBuffer);
+            fluidEffect.Parameters["densityScratch"].SetValue(densityScratchBuffer);
 
-                        Vector3 sourcePos = ClampToDomain(cell.ToVector3() - grid.GetVelocity(cell) * dt);
+            fluidEffect.Techniques[0].Passes["Advect"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
 
-                        Vector3 sampledVelocity = grid.SampleVelocity(sourcePos);
-                        float sampledDensity = grid.SampleDensity(sourcePos);
-
-                        if (blocked[idx])
-                        {
-                            sampledVelocity = Vector3.Zero;
-                            sampledDensity = 0f;
-                        }
-
-                        scratch.SetVelocity(cell, sampledVelocity);
-                        scratch.SetDensity(cell, sampledDensity);
-                    }
-
-            (grid, scratch) = (scratch, grid); // this tick's result becomes current, old current becomes next tick's scratch buffer
+            (velocityBuffer, velocityScratchBuffer) = (velocityScratchBuffer, velocityBuffer);
+            (densityBuffer, densityScratchBuffer) = (densityScratchBuffer, densityBuffer);
         }
 
-        // Diffusion (thesis 4.1.5): spreads velocity and density into each cell's real face neighbors over time
-        // The effect that softens the seeded cube's sharp edges into a rounder blob, distinct from advection's pure
-        // transport (advection moves the field, diffusion blurs it)
+        // Diffusion: spreads velocity and density into each cell's real face neighbors over time.
+        // Snapshots the pre-iteration field as the Jacobi right-hand side once, then runs diffusionIterations relaxation passes
         //
-        // Boundary handling: only real (in-domain, unblocked) neighbors are summed AND counted, and that count,
-        // not a fixed 6, is what both the sum and the divisor use
-        //
-        // The Jacobi right-hand side (diffuseSourceDensity/diffuseSourceVelocity, thesis Eq 3.13's "b") is
-        // snapshotted once per call, before the iteration loop, and held fixed across all 30 iterations
-        //
-        // Known problem: the thesis does not have any cohesion term, so the diffusion step alone will 
-        // eventually spread the seeded cube into a uniform low-density haze across the whole domain
-        // Thesis' own testing involves continuously seeding new fluid to counteract this, but this implementation does not do that, 
-        // so the seeded cube will eventually vanish
-        private void Diffuse(float dt)
+        // Known problem carried over unchanged from the CPU version. The thesis has no cohesion term, so this
+        // step alone eventually spreads the seeded cube into a uniform low-density haze across the whole domain
+        // Cohesion or a limit to diffusion can be added later, or a constant stream of fluid can be provided like the master's thesis
+        private void Diffuse(float dt, int groups)
         {
+            fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
+            fluidEffect.Parameters["density"].SetValue(densityBuffer);
+            fluidEffect.Parameters["diffuseSourceVelocity"].SetValue(diffuseSourceVelocityBuffer);
+            fluidEffect.Parameters["diffuseSourceDensity"].SetValue(diffuseSourceDensityBuffer);
+            fluidEffect.Techniques[0].Passes["SnapshotDiffuseSource"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
+
             float a = diffusionRate * dt;
-
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                    {
-                        Point3 cell = new Point3(x, y, z);
-                        int idx = grid.Index(cell);
-                        diffuseSourceDensity[idx] = grid.GetDensity(cell);
-                        diffuseSourceVelocity[idx] = grid.GetVelocity(cell);
-                    }
+            fluidEffect.Parameters["diffusionA"].SetValue(a);
 
             for (int iteration = 0; iteration < diffusionIterations; iteration++)
             {
-                for (int x = 0; x < grid.size.X; x++)
-                    for (int y = 0; y < grid.size.Y; y++)
-                        for (int z = 0; z < grid.size.Z; z++)
-                        {
-                            Point3 cell = new Point3(x, y, z);
-                            int idx = grid.Index(cell);
+                fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
+                fluidEffect.Parameters["density"].SetValue(densityBuffer);
+                fluidEffect.Parameters["velocityScratch"].SetValue(velocityScratchBuffer);
+                fluidEffect.Parameters["densityScratch"].SetValue(densityScratchBuffer);
 
-                            if (blocked[idx])
-                            {
-                                scratch.SetDensity(cell, 0f);
-                                scratch.SetVelocity(cell, Vector3.Zero);
-                                continue;
-                            }
+                fluidEffect.Techniques[0].Passes["DiffuseIteration"].ApplyCompute();
+                App.graphicsDevice.DispatchCompute(groups, 1, 1);
 
-                            int realNeighborCount = RealNeighborSums(cell, out float densitySum, out Vector3 velocitySum);
-
-                            float newDensity = (diffuseSourceDensity[idx] + a * densitySum) / (1f + realNeighborCount * a);
-                            scratch.SetDensity(cell, newDensity);
-
-                            Vector3 newVelocity = (diffuseSourceVelocity[idx] + a * velocitySum) / (1f + realNeighborCount * a);
-                            scratch.SetVelocity(cell, newVelocity);
-                        }
-
-                (grid, scratch) = (scratch, grid); // this iteration's result becomes current for the next iteration
+                (velocityBuffer, velocityScratchBuffer) = (velocityScratchBuffer, velocityBuffer);
+                (densityBuffer, densityScratchBuffer) = (densityScratchBuffer, densityBuffer);
             }
         }
 
-        // Sums density/velocity over only the neighbors that actually exist (in-domain and not solid) and returns
-        // how many that was, for Diffuse's boundary-correct divisor
-        private int RealNeighborSums(Point3 cell, out float densitySum, out Vector3 velocitySum)
-        {
-            densitySum = 0f;
-            velocitySum = Vector3.Zero;
-            int count = 0;
-
-            foreach (Point3 offset in neighborOffsets)
-            {
-                Point3 neighbor = cell + offset;
-                if (!grid.IsInsideLocal(neighbor))
-                    continue;
-
-                int neighborIdx = grid.Index(neighbor);
-                if (blocked[neighborIdx])
-                    continue;
-
-                densitySum += grid.GetDensity(neighbor);
-                velocitySum += grid.GetVelocity(neighbor);
-                count++;
-            }
-
-            return count;
-        }
-
-        // Pressure projection: the velocity field coming out of Diffuse has nonzero divergence in general
+        // Pressure projection: the velocity field coming out of Diffuse has nonzero divergence in general.
         // Projection finds the pressure field whose gradient, subtracted from velocity, cancels that divergence out
-        // the step that makes this an incompressible fluid simulation rather than just an advected, diffusing blob of density 
-        // with no physical constraint holding its volume together
-        private void Project()
+        private void Project(int groups)
         {
-            ComputeDivergence();
-            SolvePressure();
-            SubtractPressureGradient();
-        }
+            fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
+            fluidEffect.Parameters["divergence"].SetValue(divergenceBuffer);
+            fluidEffect.Techniques[0].Passes["ComputeDivergence"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
 
-        // Divergence of the velocity field: how much each cell's velocity spreads outward vs. converges inward
-        // This becomes the source term for the pressure Poisson solve below
-        private void ComputeDivergence()
-        {
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                    {
-                        Point3 cell = new Point3(x, y, z);
-                        int idx = grid.Index(cell);
-
-                        if (blocked[idx])
-                        {
-                            divergence[idx] = 0f;
-                            continue;
-                        }
-
-                        Vector3 right = BoundaryVelocity(cell, cell + new Point3(1, 0, 0));
-                        Vector3 left = BoundaryVelocity(cell, cell + new Point3(-1, 0, 0));
-                        Vector3 top = BoundaryVelocity(cell, cell + new Point3(0, 1, 0));
-                        Vector3 bottom = BoundaryVelocity(cell, cell + new Point3(0, -1, 0));
-                        Vector3 front = BoundaryVelocity(cell, cell + new Point3(0, 0, 1));
-                        Vector3 back = BoundaryVelocity(cell, cell + new Point3(0, 0, -1));
-
-                        divergence[idx] = ((right.X - left.X) + (top.Y - bottom.Y) + (front.Z - back.Z)) / 2f;
-                    }
-        }
-
-        // Solves the Poisson equation for pressure (thesis Eq. 3.6/3.13, with alpha=-1, beta=6 for the pressure
-        // case): p_new = (sum of 6 neighboring p values - divergence) / 6. Same Jacobi ping-pong as Diffuse and
-        // same iteration count, but no "old self" term the way diffusion has "old velocity"
-        // Pressure isn't being transported or decayed, this is pure relaxation toward satisfying the equation
-        // pressure/pressureScratch are warm-started (not zeroed here) so each tick's solve starts from last tick's answer
-        private void SolvePressure()
-        {
+            // pressure/pressureScratch are warm-started (never cleared) so each tick's solve starts from last tick's answer, same as the CPU version
+            // Outer loop stays sequential, each iteration reads the previous iteration's swapped-in pressure field
             for (int iteration = 0; iteration < diffusionIterations; iteration++)
             {
-                for (int x = 0; x < grid.size.X; x++)
-                    for (int y = 0; y < grid.size.Y; y++)
-                        for (int z = 0; z < grid.size.Z; z++)
-                        {
-                            Point3 cell = new Point3(x, y, z);
-                            int idx = grid.Index(cell);
+                fluidEffect.Parameters["pressure"].SetValue(pressureBuffer);
+                fluidEffect.Parameters["pressureScratch"].SetValue(pressureScratchBuffer);
+                fluidEffect.Parameters["divergence"].SetValue(divergenceBuffer);
 
-                            if (blocked[idx])
-                            {
-                                pressureScratch[idx] = 0f;
-                                continue;
-                            }
+                fluidEffect.Techniques[0].Passes["SolvePressureIteration"].ApplyCompute();
+                App.graphicsDevice.DispatchCompute(groups, 1, 1);
 
-                            float neighborSum =
-                                BoundaryPressure(cell, cell + new Point3(1, 0, 0), pressure) + BoundaryPressure(cell, cell + new Point3(-1, 0, 0), pressure) +
-                                BoundaryPressure(cell, cell + new Point3(0, 1, 0), pressure) + BoundaryPressure(cell, cell + new Point3(0, -1, 0), pressure) +
-                                BoundaryPressure(cell, cell + new Point3(0, 0, 1), pressure) + BoundaryPressure(cell, cell + new Point3(0, 0, -1), pressure);
-
-                            pressureScratch[idx] = (neighborSum - divergence[idx]) / 6f;
-                        }
-
-                (pressure, pressureScratch) = (pressureScratch, pressure); // this iteration's result becomes current for the next iteration
+                (pressureBuffer, pressureScratchBuffer) = (pressureScratchBuffer, pressureBuffer);
             }
+
+            fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
+            fluidEffect.Parameters["pressure"].SetValue(pressureBuffer);
+            fluidEffect.Techniques[0].Passes["SubtractPressureGradient"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
         }
 
-        // Subtracts the gradient of the solved pressure field from velocity, the step that actually produces the divergence-free 
-        // (incompressible) result projection exists to compute
-        private void SubtractPressureGradient()
+        // Rescales every cell's density so the domain's total mass matches expectedTotalDensityMass, captured once at seed time
+        private void RenormalizeDensity(int groups)
         {
-            for (int x = 0; x < grid.size.X; x++)
-                for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
-                    {
-                        Point3 cell = new Point3(x, y, z);
-                        int idx = grid.Index(cell);
+            int zGroups = (grid.size.Z + 63) / 64;
 
-                        if (blocked[idx])
-                            continue;
+            fluidEffect.Parameters["density"].SetValue(densityBuffer);
+            fluidEffect.Parameters["densityPartialSums"].SetValue(densityPartialSumsBuffer);
+            fluidEffect.Techniques[0].Passes["SumDensitySlice"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(zGroups, 1, 1);
 
-                        float right = BoundaryPressure(cell, cell + new Point3(1, 0, 0), pressure);
-                        float left = BoundaryPressure(cell, cell + new Point3(-1, 0, 0), pressure);
-                        float top = BoundaryPressure(cell, cell + new Point3(0, 1, 0), pressure);
-                        float bottom = BoundaryPressure(cell, cell + new Point3(0, -1, 0), pressure);
-                        float front = BoundaryPressure(cell, cell + new Point3(0, 0, 1), pressure);
-                        float back = BoundaryPressure(cell, cell + new Point3(0, 0, -1), pressure);
+            densityPartialSumsBuffer.GetData(densityPartialSumsCpu);
+            float currentTotal = 0f;
+            for (int i = 0; i < densityPartialSumsCpu.Length; i++)
+                currentTotal += densityPartialSumsCpu[i];
 
-                        Vector3 gradient = new Vector3(right - left, top - bottom, front - back) / 2f;
-                        grid.SetVelocity(cell, grid.GetVelocity(cell) - gradient);
-                    }
+            if (currentTotal < 0.001f)
+                return; // nothing to rescale, and dividing by 0 would blow up
+
+            float scale = expectedTotalDensityMass / currentTotal;
+            fluidEffect.Parameters["renormalizeScale"].SetValue(scale);
+            fluidEffect.Parameters["density"].SetValue(densityBuffer);
+            fluidEffect.Techniques[0].Passes["RescaleDensity"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
         }
 
-        // Velocity at "neighbor" as seen from "cell": the real value if the neighbor exists and isn't solid,
-        // otherwise a sign-flipped reflection of cell's own velocity (thesis Eq. 4.3: u_N = -u_(N-1))
-        // This is what forces velocity to exactly zero AT the wall, rather than merely stopping it from changing across the wall the way Diffuse's boundary does
-        private Vector3 BoundaryVelocity(Point3 cell, Point3 neighbor)
-        {
-            if (!grid.IsInsideLocal(neighbor))
-                return -grid.GetVelocity(cell);
-
-            int neighborIdx = grid.Index(neighbor);
-            if (blocked[neighborIdx])
-                return -grid.GetVelocity(cell);
-
-            return grid.GetVelocity(neighbor);
-        }
-
-        // Pressure at "neighbor" as seen from "cell", read from the given field (pressure or pressureScratch): 
-        // the real value if the neighbor exists and isn't solid, otherwise a plain (unsigned) mirror of cell's own pressure
-        // Same zero-gradient idea as Diffuse's boundary, just expressed as an explicit mirror here, 
-        // since pressure's fixed 6-neighbor formula (unlike Diffuse's per-cell neighbor count) expects a value for all 6 directions every time
-        private float BoundaryPressure(Point3 cell, Point3 neighbor, float[] pressureField)
-        {
-            if (!grid.IsInsideLocal(neighbor))
-                return pressureField[grid.Index(cell)];
-
-            int neighborIdx = grid.Index(neighbor);
-            if (blocked[neighborIdx])
-                return pressureField[grid.Index(cell)];
-
-            return pressureField[neighborIdx];
-        }
-
-        // Keeps a back-traced sample position inside the range SampleDensity/SampleVelocity can safely read
-        private Vector3 ClampToDomain(Vector3 localPos)
-        {
-            return new Vector3(
-                MathHelper.Clamp(localPos.X, 0.001f, grid.size.X - 1.001f),
-                MathHelper.Clamp(localPos.Y, 0.001f, grid.size.Y - 1.001f),
-                MathHelper.Clamp(localPos.Z, 0.001f, grid.size.Z - 1.001f));
-        }
-
-        // A cell blocks fluid motion if its world position is outside the addressable world, 
+        // A cell blocks fluid motion if its world position is outside the addressable world,
         // or solid there and not this handler's own fluid. wasVisible (this handler's own live state) is checked before
         // worldData.IsVoxelSolid for the same reason FluidHandler checks fluidGrid.IsFluid first
         // Our own rendered fluid voxels share the same solid render bit as real terrain, and worldData's copy only catches up once
@@ -581,12 +476,13 @@ namespace NAADF.World.Data
 
         // Diffs the domain's density-above-threshold state against wasVisible and only re-writes cells whose
         // visible state actually changed. Same dirty-driven write FluidHandler does via its dirtyCells list, just
-        // computed by a full-domain scan here since there's no separate list of what moved
+        // computed by a full-domain scan here since there's no separate list of what moved.
+        // Reads grid.GetDensity, which Update() refreshes from the GPU via GetData right before calling this
         private void ApplyToWorld()
         {
-            for (int x = 0; x < grid.size.X; x++)
+            for (int z = 0; z < grid.size.Z; z++)
                 for (int y = 0; y < grid.size.Y; y++)
-                    for (int z = 0; z < grid.size.Z; z++)
+                    for (int x = 0; x < grid.size.X; x++)
                     {
                         Point3 local = new Point3(x, y, z);
                         int idx = grid.Index(local);

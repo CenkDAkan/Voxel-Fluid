@@ -93,12 +93,17 @@ namespace NAADF
 
         public void RenderImGui()
         {
-            if (ImGui.Button("Load flat test scene"))
+            if (ImGui.Button("Load empty test scene"))
             {
-                App.worldHandler.LoadFlatFluidTestScene(); // resets the world's own activeFluidMode to None internally
-                mode = FluidSimulationMode.None;            // keep this combo's displayed selection in sync with that reset
+                App.worldHandler.LoadEmptyTestScene(); // resets the world's own activeFluidMode to None internally
+                mode = FluidSimulationMode.None;        // keep this combo's displayed selection in sync with that reset
             }
-            ImGuiCommon.HelperIcon("Regenerates the world as empty and carves a flat floor at a fixed world position, so fluid testing isn't confounded by oasis.cvox's uneven terrain. Also resets the fluid mode below to None.", 500);
+            ImGuiCommon.HelperIcon("Regenerates the world with every voxel cleared - a genuinely blank canvas, no floor, no leftover geometry - so a controlled scene (e.g. a waterfall) can be built from scratch with the normal editing tools. Also resets the fluid mode below to None.", 500);
+
+            ImGui.SameLine();
+            if (ImGui.Button("Build flat floor"))
+                App.worldHandler.BuildFlatTestFloor();
+            ImGuiCommon.HelperIcon("Optional: carves a flat 128x128 reference floor at the empty scene's anchor point, for testing that wants a flat surface instead of custom-built terrain. Best used right after \"Load empty test scene\" - carves into whatever terrain is currently there otherwise.", 500);
 
             ImGui.SameLine();
             if (ImGui.Button("Load oasis scene"))
@@ -129,6 +134,13 @@ namespace NAADF
             {
                 ImGui.Checkbox("Enable dense gravity", ref App.worldHandler.worldData.denseFluidHandler.enableGravity);
                 ImGuiCommon.HelperIcon("Off by default: a freshly placed domain starts suspended so diffusion's spreading effect can be checked in isolation, without racing the still-unimplemented floor-resting behavior at low framerates. Check this to let it fall.", 500);
+
+                ImGui.SliderInt("Domain size", ref App.worldHandler.worldData.denseFluidHandler.domainSize, 4, 128);
+                ImGuiCommon.HelperIcon("Cubic domain side length. Doesn't resize the currently placed domain - click \"Replace domain\" below (or reselect Dense Eulerian above) to tear down and recreate it at the new size. Large values can make the engine unresponsive.", 500);
+
+                if (ImGui.Button("Replace domain"))
+                    App.worldHandler.worldData.ApplyFluidSimulationMode(FluidSimulationMode.DenseEulerian);
+                ImGuiCommon.HelperIcon("Clears the current domain and places a fresh one at the size set above, same as switching the mode above away and back.", 500);
             }
         }
     }
