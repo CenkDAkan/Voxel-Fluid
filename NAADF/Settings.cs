@@ -135,6 +135,24 @@ namespace NAADF
                 ImGui.Checkbox("Enable dense gravity", ref App.worldHandler.worldData.denseFluidHandler.enableGravity);
                 ImGuiCommon.HelperIcon("Off by default: a freshly placed domain starts suspended so diffusion's spreading effect can be checked in isolation, without racing the still-unimplemented floor-resting behavior at low framerates. Check this to let it fall.", 500);
 
+                ImGui.SliderFloat("Gravity strength", ref App.worldHandler.worldData.denseFluidHandler.gravityStrength, 0f, 100f);
+                ImGuiCommon.HelperIcon("Downward acceleration, same arbitrary unit scale as everything else here. Default (20) matches FluidHandler's sparse-particle gravity.", 500);
+
+                ImGui.Checkbox("Enable cohesion", ref App.worldHandler.worldData.denseFluidHandler.enableCohesion);
+                ImGuiCommon.HelperIcon("Off by default. Curvature-driven attraction meant to counteract diffusion/advection's spreading - the thesis has no cohesion term at all, this is this project's own addition.", 500);
+
+                ImGui.SliderFloat("Cohesion strength", ref App.worldHandler.worldData.denseFluidHandler.cohesionCoefficient, 0f, 200f);
+                ImGuiCommon.HelperIcon("Sigma in the CSF force formula, same arbitrary unit scale as gravity. Starting value (20) is deliberately far below the derived stability ceiling (~3900) - tune up from here.", 500);
+
+                ImGui.SliderFloat("Cohesion density strength", ref App.worldHandler.worldData.denseFluidHandler.cohesionDensityCoefficient, 0f, 20f);
+                ImGuiCommon.HelperIcon("Applied directly to density inside every one of diffusion's 30 Jacobi iterations, giving cohesion the same repeated access diffusion has, instead of one indirect nudge through velocity per tick. Much smaller scale than cohesion strength above - start low, unbounded growth over 30 iterations is the main risk.", 500);
+
+                ImGui.SliderInt("Curvature smooth iterations", ref App.worldHandler.worldData.denseFluidHandler.curvatureSmoothIterations, 0, 20);
+                ImGuiCommon.HelperIcon("How many denoising passes the density copy gets before curvature is computed from it. More passes = smoother curvature = less tick-to-tick flicker in which cells cross the visibility threshold, at the cost of blurring the actual interface it's measuring if pushed too high.", 500);
+
+                ImGui.SliderFloat("Curvature smooth blend", ref App.worldHandler.worldData.denseFluidHandler.curvatureSmoothBlend, 0f, 1f);
+                ImGuiCommon.HelperIcon("How much of each pass's neighbor average gets blended in (0 = no smoothing, 1 = fully replace with neighbor average each pass). Works together with the iteration count above.", 500);
+
                 ImGui.SliderInt("Domain size", ref App.worldHandler.worldData.denseFluidHandler.domainSize, 4, 128);
                 ImGuiCommon.HelperIcon("Cubic domain side length. Doesn't resize the currently placed domain - click \"Replace domain\" below (or reselect Dense Eulerian above) to tear down and recreate it at the new size. Large values can make the engine unresponsive.", 500);
 

@@ -31,6 +31,17 @@ StructuredBuffer<uint> blocked; // CPU-uploaded each Update via RecomputeBlocked
 
 RWStructuredBuffer<float> densityPartialSums; // one slot per Z slice, for the renormalization mass sum
 
+// Cohesion (see the Cohesion section below for the full pipeline)
+RWStructuredBuffer<float> densitySmooth;         // throwaway smoothed copy of density, used only for curvature estimation
+RWStructuredBuffer<float> densitySmoothScratch;
+RWStructuredBuffer<float4> cohesionGradient;     // xyz = unit normal n-hat, w = |grad(density)| magnitude
+RWStructuredBuffer<float> cohesionCurvature;     // frozen once per tick, reused by every diffuseIteration pass below
+
+float cohesionCoefficient;   
+float cohesionDensityCoefficient; 
+float cohesionGradientThreshold;  
+float curvatureSmoothBlend;       
+
 uint FlatIndex(int3 c)
 {
     return (uint) (c.x + c.y * (int) sizeX + c.z * (int) sizeX * (int) sizeY);
@@ -124,7 +135,18 @@ void advect(uint3 globalID : SV_DispatchThreadID)
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Diffusion: snapshot the pre-iteration field as the Jacobi right-hand side
+// Diffusion: snapshot the pre-iteration field as the Jacobi right-hand side.
+//
+// The cohesion density term went through two earlier, broken designs before this one - worth keeping the
+// history so the reasoning isn't re-litigated:
+//   1. Added directly to diffuseIteration's output, outside that kernel's stabilizing "/(1+count*diffusionA)" division
+//   2. Moved here into diffuseSourceDensity as a RAW per-cell addition of cohesionCurvature[idx]
+//      stable, but not conservative: nothing ties one cell's addition to a matching subtraction anywhere else, so it could
+//      inflate the domain's total mass every tick, which RenormalizeDensity then "fixed" by rescaling
+//      the ENTIRE field including cells that never received any addition, influencing peak density in cells the correction was supposed to help, 
+//      and eventually driving the total negative once locally negative source values propagated far enough
+// This version instead injects the DISCRETE LAPLACIAN of curvature (the difference between each cell's
+// curvature and its neighbors', summed over the same 6 faces RealNeighborSums walks) rather than curvature itself
 [numthreads(64, 1, 1)]
 void snapshotDiffuseSource(uint3 globalID : SV_DispatchThreadID)
 {
@@ -132,7 +154,30 @@ void snapshotDiffuseSource(uint3 globalID : SV_DispatchThreadID)
     if (idx >= cellCount)
         return;
 
-    diffuseSourceDensity[idx] = density[idx];
+    float cohesionFlux = 0.0f;
+    if (cohesionDensityCoefficient != 0.0f)
+    {
+        int3 cell = CoordFromIndex(idx);
+        int3 offsets[6] =
+        {
+            int3(1, 0, 0), int3(-1, 0, 0),
+            int3(0, 1, 0), int3(0, -1, 0),
+            int3(0, 0, 1), int3(0, 0, -1)
+        };
+
+        float ownCurvature = cohesionCurvature[idx];
+        [unroll]
+        for (int i = 0; i < 6; i++)
+        {
+            int3 neighbor = cell + offsets[i];
+            float neighborCurvature = (IsInside(neighbor) && blocked[FlatIndex(neighbor)] == 0)
+                ? cohesionCurvature[FlatIndex(neighbor)]
+                : ownCurvature; // zero-flux mirror: contributes nothing, matches BoundaryNormalAt/BoundaryPressureAt
+            cohesionFlux += neighborCurvature - ownCurvature;
+        }
+    }
+
+    diffuseSourceDensity[idx] = density[idx] + cohesionDensityCoefficient * dt * cohesionFlux;
     diffuseSourceVelocity[idx] = velocity[idx];
 }
 
@@ -167,7 +212,12 @@ void RealNeighborSums(int3 cell, out float densitySum, out float3 velocitySum, o
     }
 }
 
-// One Jacobi relaxation step, dispatched diffusionIterations times from C# with a buffer swap between calls
+// One Jacobi relaxation step, dispatched diffusionIterations times from C# with a buffer swap between calls.
+//
+// Gives cohesion the same direct, repeated access to density that diffusion itself has
+// diffusion gets diffusionIterations (30) direct passes spreading density outward every tick, while the velocity-space
+// cohesion force (applyCohesionForce) only gets one nudge through a single Advect sample
+// That 30-against-1 mismatch is why velocity-space cohesion alone only slowed dilution rather than reaching a stable balance
 [numthreads(64, 1, 1)]
 void diffuseIteration(uint3 globalID : SV_DispatchThreadID)
 {
@@ -188,8 +238,156 @@ void diffuseIteration(uint3 globalID : SV_DispatchThreadID)
     int count;
     RealNeighborSums(cell, densitySum, velocitySum, count);
 
-    densityScratch[idx] = (diffuseSourceDensity[idx] + diffusionA * densitySum) / (1.0f + count * diffusionA);
+    densityScratch[idx] = max(0.0f, (diffuseSourceDensity[idx] + diffusionA * densitySum) / (1.0f + count * diffusionA));
     velocityScratch[idx] = float4((diffuseSourceVelocity[idx].xyz + diffusionA * velocitySum) / (1.0f + count * diffusionA), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Cohesion: a Continuum Surface Force (Brackbill/Kothe/Zemach 1992) style attraction. Real surface tension is
+// curvature-driven, it's what makes a free liquid body relax toward a sphere (minimizing surface area), 
+// and is the mechanism meant to counteract diffusion/advection's spreading
+//
+// Three passes: (1) smooth a THROWAWAY copy of density, raw density is too noisy at this grid resolution
+// for a stable curvature estimate, this smoothed copy is never written back to the real mass-bearing density buffer; 
+// (2) compute each cell's density gradient and unit normal from the smoothed copy; 
+// (3) compute curvature (divergence of the normal field) and add sigma * curvature * grad(density) to velocity, 
+// masked to only the interface region (|grad| above threshold) so deep-interior/deep-empty cells don't get a force
+float BoundaryDensitySmoothAt(int3 cell, int3 neighbor)
+{
+    if (!IsInside(neighbor) || blocked[FlatIndex(neighbor)] != 0)
+        return densitySmooth[FlatIndex(cell)];
+    return densitySmooth[FlatIndex(neighbor)];
+}
+
+float3 BoundaryNormalAt(int3 cell, int3 neighbor)
+{
+    if (!IsInside(neighbor) || blocked[FlatIndex(neighbor)] != 0)
+        return cohesionGradient[FlatIndex(cell)].xyz;
+    return cohesionGradient[FlatIndex(neighbor)].xyz;
+}
+
+[numthreads(64, 1, 1)]
+void snapshotDensityForSmoothing(uint3 globalID : SV_DispatchThreadID)
+{
+    uint idx = globalID.x;
+    if (idx >= cellCount)
+        return;
+
+    densitySmooth[idx] = density[idx];
+}
+
+// One explicit-blend smoothing pass, dispatched a small fixed number of times with a buffer swap between calls
+// deliberately not a solved Jacobi system like Diffuse, this is pure denoising for curvature estimation, 
+// not a physically meaningful field in its own right
+[numthreads(64, 1, 1)]
+void smoothDensityIteration(uint3 globalID : SV_DispatchThreadID)
+{
+    uint idx = globalID.x;
+    if (idx >= cellCount)
+        return;
+
+    if (blocked[idx] != 0)
+    {
+        densitySmoothScratch[idx] = 0;
+        return;
+    }
+
+    int3 cell = CoordFromIndex(idx);
+    int3 offsets[6] =
+    {
+        int3(1, 0, 0), int3(-1, 0, 0),
+        int3(0, 1, 0), int3(0, -1, 0),
+        int3(0, 0, 1), int3(0, 0, -1)
+    };
+
+    float neighborSum = 0;
+    int count = 0;
+    [unroll]
+    for (int i = 0; i < 6; i++)
+    {
+        int3 neighbor = cell + offsets[i];
+        if (!IsInside(neighbor))
+            continue;
+        uint neighborIdx = FlatIndex(neighbor);
+        if (blocked[neighborIdx] != 0)
+            continue;
+        neighborSum += densitySmooth[neighborIdx];
+        count++;
+    }
+
+    float neighborAvg = count > 0 ? neighborSum / count : densitySmooth[idx];
+    densitySmoothScratch[idx] = lerp(densitySmooth[idx], neighborAvg, curvatureSmoothBlend);
+}
+
+// Central-difference gradient of the smoothed density field, normalized to a unit normal. Magnitude is
+// stashed in .w so applyCohesionForce doesn't need a second buffer
+[numthreads(64, 1, 1)]
+void computeGradientNormal(uint3 globalID : SV_DispatchThreadID)
+{
+    uint idx = globalID.x;
+    if (idx >= cellCount)
+        return;
+
+    if (blocked[idx] != 0)
+    {
+        cohesionGradient[idx] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    int3 cell = CoordFromIndex(idx);
+    float right = BoundaryDensitySmoothAt(cell, cell + int3(1, 0, 0));
+    float left = BoundaryDensitySmoothAt(cell, cell + int3(-1, 0, 0));
+    float top = BoundaryDensitySmoothAt(cell, cell + int3(0, 1, 0));
+    float bottom = BoundaryDensitySmoothAt(cell, cell + int3(0, -1, 0));
+    float front = BoundaryDensitySmoothAt(cell, cell + int3(0, 0, 1));
+    float back = BoundaryDensitySmoothAt(cell, cell + int3(0, 0, -1));
+
+    float3 gradRho = float3(right - left, top - bottom, front - back) / 2.0f;
+    float gradMag = length(gradRho);
+    float3 normal = gradMag > 1e-5f ? gradRho / gradMag : float3(0, 0, 0);
+
+    cohesionGradient[idx] = float4(normal, gradMag);
+}
+
+// Curvature = -div(normal field). Force = sigma * curvature * grad(density),
+// added straight into velocity in place, safe because it only ever reads cohesionGradient 
+// and its own cell's blocked/threshold state, never a velocity neighbor
+//
+// Also stashes curvature itself into cohesionCurvature, frozen for the rest of this tick and reused by every
+// diffuseIteration pass in Diffuse, computed once here rather than 30 times there
+[numthreads(64, 1, 1)]
+void applyCohesionForce(uint3 globalID : SV_DispatchThreadID)
+{
+    uint idx = globalID.x;
+    if (idx >= cellCount)
+        return;
+
+    if (blocked[idx] != 0)
+    {
+        cohesionCurvature[idx] = 0;
+        return;
+    }
+
+    float gradMag = cohesionGradient[idx].w;
+    if (gradMag < cohesionGradientThreshold)
+    {
+        cohesionCurvature[idx] = 0;
+        return;
+    }
+
+    int3 cell = CoordFromIndex(idx);
+    float3 right = BoundaryNormalAt(cell, cell + int3(1, 0, 0));
+    float3 left = BoundaryNormalAt(cell, cell + int3(-1, 0, 0));
+    float3 top = BoundaryNormalAt(cell, cell + int3(0, 1, 0));
+    float3 bottom = BoundaryNormalAt(cell, cell + int3(0, -1, 0));
+    float3 front = BoundaryNormalAt(cell, cell + int3(0, 0, 1));
+    float3 back = BoundaryNormalAt(cell, cell + int3(0, 0, -1));
+
+    float curvature = -((right.x - left.x) + (top.y - bottom.y) + (front.z - back.z)) / 2.0f;
+    cohesionCurvature[idx] = curvature;
+
+    float3 gradRho = cohesionGradient[idx].xyz * gradMag;
+    velocity[idx].xyz += cohesionCoefficient * curvature * gradRho * dt;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -308,6 +506,10 @@ void rescaleDensity(uint3 globalID : SV_DispatchThreadID)
 technique Tech0
 {
     pass ApplyExternalForces { ComputeShader = compile cs_5_0 applyExternalForces(); }
+    pass SnapshotDensityForSmoothing { ComputeShader = compile cs_5_0 snapshotDensityForSmoothing(); }
+    pass SmoothDensityIteration { ComputeShader = compile cs_5_0 smoothDensityIteration(); }
+    pass ComputeGradientNormal { ComputeShader = compile cs_5_0 computeGradientNormal(); }
+    pass ApplyCohesionForce { ComputeShader = compile cs_5_0 applyCohesionForce(); }
     pass Advect { ComputeShader = compile cs_5_0 advect(); }
     pass SnapshotDiffuseSource { ComputeShader = compile cs_5_0 snapshotDiffuseSource(); }
     pass DiffuseIteration { ComputeShader = compile cs_5_0 diffuseIteration(); }

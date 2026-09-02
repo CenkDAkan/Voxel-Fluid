@@ -15,6 +15,11 @@ namespace NAADF.World.Data
     * every tick, over every cell in a bounded domain, regardless of how much of that domain is actually fluid
     * Diffusion is applied to both velocity and density, matching the masters thesis's implementation
     *
+    * Cohesion is a Continuum Surface Force style attraction added on top of the thesis's own pipeline,
+    * the thesis has no cohesion term at all, so without it diffusion's spreading is a one-way process with nothing opposing it
+    * Cohesion is curvature-driven (pulls concave regions inward, same mechanism that makes a real liquid body relax toward a sphere), 
+    * not just "pull toward denser neighbors", see denseFluidSim.fx's Cohesion section for the full derivation and formula
+    *
     * The physics pipeline (forces/advect/diffuse/project/renormalize) runs entirely on GPU via denseFluidSim.fx, 
     * mirroring the CPU version's own ping-pong swap points buffer-for-buffer
     * `grid` is kept only as a CPU-side mirror, its density array is refreshed from the GPU once per Update call (via GetData) 
@@ -55,18 +60,43 @@ namespace NAADF.World.Data
         private StructuredBuffer blockedBuffer;
         private StructuredBuffer densityPartialSumsBuffer; // one slot per Z slice, for RenormalizeDensity's mass sum
 
+        // Cohesion buffers - densitySmooth/Scratch are a throwaway denoised copy of density, never written back
+        private StructuredBuffer densitySmoothBuffer;
+        private StructuredBuffer densitySmoothScratchBuffer;
+        private StructuredBuffer cohesionGradientBuffer;
+
+        // Curvature, frozen once per tick by ApplyCohesion, reused by every one of Diffuse's 30 Jacobi iterations
+        private StructuredBuffer cohesionCurvatureBuffer;
+
         private float[] densityPartialSumsCpu;
         private Vector4[] velocityLogScratch;
 
-        // Same magnitude as FluidHandler's gravity so the two are physically comparable, not just algorithmically
-        private Vector3 gravity = new Vector3(0f, -20f, 0f);
+        public float gravityStrength = 20f;
 
         public bool enableGravity = false;
 
         // How fast density/velocity spread into neighboring cells per second
-        private float diffusionRate = 0.1f;
+        private float diffusionRate = 0.01f;
 
         private const int diffusionIterations = 30;
+
+        public bool enableCohesion = false;
+
+        // Force strength (sigma in the CSF formula)
+        public float cohesionCoefficient = 20f;
+
+        // Density-space term applied inside every one of Diffuse's 30 Jacobi iterations, 
+        // gives cohesion the same direct, repeated access to density that diffusion itself has,
+        // instead of routing everything through one indirect velocity-mediated Advect sample per tick
+        public float cohesionDensityCoefficient = 2f;
+
+        // Only apply the cohesion force where |grad(density)| exceeds this - keeps deep-interior/deep-empty
+        // cells (gradient ~0, direction is just noise) from getting a spurious force
+        private float cohesionGradientThreshold = 0.05f;
+
+        // How much of smoothDensityIteration's neighbor average to blend in per pass
+        public float curvatureSmoothBlend = 0.5f;
+        public int curvatureSmoothIterations = 8;
 
         // Captured once at seed time
         private float expectedTotalDensityMass;
@@ -200,12 +230,21 @@ namespace NAADF.World.Data
             blockedBuffer = new StructuredBuffer(App.graphicsDevice, typeof(uint), cellCount, BufferUsage.None, ShaderAccess.Read);
             densityPartialSumsBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), grid.size.Z, BufferUsage.None, ShaderAccess.ReadWrite);
 
+            densitySmoothBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            densitySmoothScratchBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            cohesionGradientBuffer = new StructuredBuffer(App.graphicsDevice, typeof(Vector4), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+            cohesionCurvatureBuffer = new StructuredBuffer(App.graphicsDevice, typeof(float), cellCount, BufferUsage.None, ShaderAccess.ReadWrite);
+
             velocityBuffer.SetData(new Vector4[cellCount]);
             velocityScratchBuffer.SetData(new Vector4[cellCount]);
             densityBuffer.SetData(grid.DensityArray); // seeded by SeedBlob just before this call
             densityScratchBuffer.SetData(new float[cellCount]);
             pressureBuffer.SetData(new float[cellCount]);
             pressureScratchBuffer.SetData(new float[cellCount]);
+            densitySmoothBuffer.SetData(new float[cellCount]);
+            densitySmoothScratchBuffer.SetData(new float[cellCount]);
+            cohesionGradientBuffer.SetData(new Vector4[cellCount]);
+            cohesionCurvatureBuffer.SetData(new float[cellCount]);
 
             fluidEffect.Parameters["sizeX"].SetValue((uint)grid.size.X);
             fluidEffect.Parameters["sizeY"].SetValue((uint)grid.size.Y);
@@ -264,6 +303,10 @@ namespace NAADF.World.Data
             diffuseSourceVelocityBuffer?.Dispose();
             blockedBuffer?.Dispose();
             densityPartialSumsBuffer?.Dispose();
+            densitySmoothBuffer?.Dispose();
+            densitySmoothScratchBuffer?.Dispose();
+            cohesionGradientBuffer?.Dispose();
+            cohesionCurvatureBuffer?.Dispose();
         }
 
         // Fills the blocked cache for the whole domain, see the field's comment for why this only needs to run
@@ -332,6 +375,8 @@ namespace NAADF.World.Data
 
             if (enableGravity)
                 ApplyExternalForces(dt, groups);
+            if (enableCohesion)
+                ApplyCohesion(dt, groups);
             Advect(dt, groups);
             Diffuse(dt, groups);
             Project(groups);
@@ -344,10 +389,45 @@ namespace NAADF.World.Data
         private void ApplyExternalForces(float dt, int groups)
         {
             fluidEffect.Parameters["dt"].SetValue(dt);
-            fluidEffect.Parameters["gravity"].SetValue(gravity);
+            fluidEffect.Parameters["gravity"].SetValue(new Vector3(0f, -gravityStrength, 0f));
             fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
 
             fluidEffect.Techniques[0].Passes["ApplyExternalForces"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
+        }
+
+        // Curvature-driven cohesion force, added to velocity from this tick's starting density shape, same timing as gravity above
+        // Three GPU passes: smooth a throwaway density copy, compute its gradient/normal, then compute curvature and apply the force
+        private void ApplyCohesion(float dt, int groups)
+        {
+            fluidEffect.Parameters["density"].SetValue(densityBuffer);
+            fluidEffect.Parameters["densitySmooth"].SetValue(densitySmoothBuffer);
+            fluidEffect.Techniques[0].Passes["SnapshotDensityForSmoothing"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
+
+            fluidEffect.Parameters["curvatureSmoothBlend"].SetValue(curvatureSmoothBlend);
+            for (int iteration = 0; iteration < curvatureSmoothIterations; iteration++)
+            {
+                fluidEffect.Parameters["densitySmooth"].SetValue(densitySmoothBuffer);
+                fluidEffect.Parameters["densitySmoothScratch"].SetValue(densitySmoothScratchBuffer);
+                fluidEffect.Techniques[0].Passes["SmoothDensityIteration"].ApplyCompute();
+                App.graphicsDevice.DispatchCompute(groups, 1, 1);
+
+                (densitySmoothBuffer, densitySmoothScratchBuffer) = (densitySmoothScratchBuffer, densitySmoothBuffer);
+            }
+
+            fluidEffect.Parameters["densitySmooth"].SetValue(densitySmoothBuffer);
+            fluidEffect.Parameters["cohesionGradient"].SetValue(cohesionGradientBuffer);
+            fluidEffect.Techniques[0].Passes["ComputeGradientNormal"].ApplyCompute();
+            App.graphicsDevice.DispatchCompute(groups, 1, 1);
+
+            fluidEffect.Parameters["dt"].SetValue(dt);
+            fluidEffect.Parameters["cohesionCoefficient"].SetValue(cohesionCoefficient);
+            fluidEffect.Parameters["cohesionGradientThreshold"].SetValue(cohesionGradientThreshold);
+            fluidEffect.Parameters["cohesionGradient"].SetValue(cohesionGradientBuffer);
+            fluidEffect.Parameters["cohesionCurvature"].SetValue(cohesionCurvatureBuffer);
+            fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
+            fluidEffect.Techniques[0].Passes["ApplyCohesionForce"].ApplyCompute();
             App.graphicsDevice.DispatchCompute(groups, 1, 1);
         }
 
@@ -373,11 +453,13 @@ namespace NAADF.World.Data
         // Diffusion: spreads velocity and density into each cell's real face neighbors over time.
         // Snapshots the pre-iteration field as the Jacobi right-hand side once, then runs diffusionIterations relaxation passes
         //
-        // Known problem carried over unchanged from the CPU version. The thesis has no cohesion term, so this
-        // step alone eventually spreads the seeded cube into a uniform low-density haze across the whole domain
-        // Cohesion or a limit to diffusion can be added later, or a constant stream of fluid can be provided like the master's thesis
+        // The thesis has no cohesion term, so this step alone eventually spreads a resting blob into a uniform low-density haze
         private void Diffuse(float dt, int groups)
         {
+            fluidEffect.Parameters["dt"].SetValue(dt);
+            fluidEffect.Parameters["cohesionDensityCoefficient"].SetValue(enableCohesion ? cohesionDensityCoefficient : 0f);
+            fluidEffect.Parameters["cohesionCurvature"].SetValue(cohesionCurvatureBuffer);
+
             fluidEffect.Parameters["velocity"].SetValue(velocityBuffer);
             fluidEffect.Parameters["density"].SetValue(densityBuffer);
             fluidEffect.Parameters["diffuseSourceVelocity"].SetValue(diffuseSourceVelocityBuffer);
