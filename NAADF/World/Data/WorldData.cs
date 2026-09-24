@@ -21,6 +21,7 @@ namespace NAADF.World.Data
         None,
         SparseParticles,
         DenseEulerian,
+        SparseEulerian,
     }
 
     public class WorldData : IDisposable
@@ -53,6 +54,7 @@ namespace NAADF.World.Data
         public EditingHandler editingHandler;
         public FluidHandler fluidHandler;
         public DenseFluidHandler denseFluidHandler;
+        public SparseFluidHandler sparseFluidHandler;
         public FluidSimulationMode activeFluidMode = FluidSimulationMode.None;
 
         private const int GPU_MAX_ELEMENTS_UINT = 1024 * 1024 * 511;
@@ -104,6 +106,7 @@ namespace NAADF.World.Data
             editingHandler = new EditingHandler(this);
             fluidHandler = new FluidHandler(this);
             denseFluidHandler = new DenseFluidHandler(this);
+            sparseFluidHandler = new SparseFluidHandler(this);
             blockHashingHandler = new BlockHashingHandler(this, 0, 0.5f, (worldGenSegmentSizeInVoxels * worldGenSegmentSizeInVoxels * worldGenSegmentSizeInVoxels) / 64);
         }
 
@@ -132,6 +135,8 @@ namespace NAADF.World.Data
                 fluidHandler.Update(gameTime);
             else if (activeFluidMode == FluidSimulationMode.DenseEulerian)
                 denseFluidHandler.Update(gameTime);
+            else if (activeFluidMode == FluidSimulationMode.SparseEulerian)
+                sparseFluidHandler.Update(gameTime);
             changeHandler.Update();
             boundHandler.Update();
         }
@@ -145,6 +150,8 @@ namespace NAADF.World.Data
                 fluidHandler.ClearAll();
             else if (activeFluidMode == FluidSimulationMode.DenseEulerian)
                 denseFluidHandler.ClearAll();
+            else if (activeFluidMode == FluidSimulationMode.SparseEulerian)
+                sparseFluidHandler.ClearAll();
 
             activeFluidMode = mode;
 
@@ -152,6 +159,8 @@ namespace NAADF.World.Data
                 fluidHandler.SeedDefaultScenario();
             else if (mode == FluidSimulationMode.DenseEulerian)
                 denseFluidHandler.SeedDefaultScenario();
+            else if (mode == FluidSimulationMode.SparseEulerian)
+                sparseFluidHandler.SeedDefaultScenario();
         }
 
         // Builds the entire world on the GPU one worldGen segment at a time, then pulls the resulting

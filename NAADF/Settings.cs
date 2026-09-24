@@ -106,6 +106,11 @@ namespace NAADF
             ImGuiCommon.HelperIcon("Optional: carves a flat 128x128 reference floor at the empty scene's anchor point, for testing that wants a flat surface instead of custom-built terrain. Best used right after \"Load empty test scene\" - carves into whatever terrain is currently there otherwise.", 500);
 
             ImGui.SameLine();
+            if (ImGui.Button("Build pit floor"))
+                App.worldHandler.BuildPitTestFloor();
+            ImGuiCommon.HelperIcon("A 20x20 inverted (stepped) pyramid - deepest at the center, sloping up to a walled rim - for testing genuinely RESTING fluid rather than an ever-spreading film on open ground. Aim near the center when seeding so the fluid drops into the deepest point. Best used right after \"Load empty test scene\".", 500);
+
+            ImGui.SameLine();
             if (ImGui.Button("Load oasis scene"))
             {
                 App.worldHandler.LoadOasisScene();
@@ -159,6 +164,24 @@ namespace NAADF
                 if (ImGui.Button("Replace domain"))
                     App.worldHandler.worldData.ApplyFluidSimulationMode(FluidSimulationMode.DenseEulerian);
                 ImGuiCommon.HelperIcon("Clears the current domain and places a fresh one at the size set above, same as switching the mode above away and back.", 500);
+            }
+
+            if (mode == FluidSimulationMode.SparseEulerian)
+            {
+                ImGui.Checkbox("Enable gravity", ref App.worldHandler.worldData.sparseFluidHandler.enableGravity);
+                ImGuiCommon.HelperIcon("On by default, unlike the dense arm - there's no domain-placement race to avoid here (seeding is explicit, via the combo above or the P key), and the point of the default scenario is watching it fall and settle without evaporating.", 500);
+
+                ImGui.SliderFloat("Gravity strength", ref App.worldHandler.worldData.sparseFluidHandler.gravityStrength, 0f, 100f);
+                ImGuiCommon.HelperIcon("Downward acceleration, same arbitrary unit scale as the other two arms. Default (20) matches both.", 500);
+                // Band width / reinit interval sliders removed (2026-09-04): those only meant something for the
+                // arm's original narrow-band level-set design. The current Volume-of-Fluid design tracks exactly
+                // whichever cells hold fill > 0, with no separate band or periodic reinitialization step at all.
+
+                ImGui.SliderFloat("Velocity damping / sec", ref App.worldHandler.worldData.sparseFluidHandler.velocityDampingPerSecond, 0f, 1f);
+                ImGuiCommon.HelperIcon("Fraction of velocity retained per second (1 = no damping/frictionless, lower = more viscous). Pressure projection alone only stops motion INTO a wall (free-slip), not sliding along one - without this a settled puddle can slosh along the floor forever instead of coming to rest.", 500);
+
+                ImGui.SliderInt("Stagnant ticks before destroy", ref App.worldHandler.worldData.sparseFluidHandler.stagnantTicksBeforeDestroy, 1, 120);
+                ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it's destroyed. Too low and a splash gets whittled away before it can consolidate into a resting puddle; too high and a genuinely thinning film on open ground lingers longer, tracked but invisible, before cleanup.", 500);
             }
         }
     }
