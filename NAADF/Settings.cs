@@ -168,20 +168,34 @@ namespace NAADF
 
             if (mode == FluidSimulationMode.SparseEulerian)
             {
-                ImGui.Checkbox("Enable gravity", ref App.worldHandler.worldData.sparseFluidHandler.enableGravity);
+                ImGui.Checkbox("Enable gravity", ref App.worldHandler.worldData.sparseFluidHandler.solver.enableGravity);
                 ImGuiCommon.HelperIcon("On by default, unlike the dense arm - there's no domain-placement race to avoid here (seeding is explicit, via the combo above or the P key), and the point of the default scenario is watching it fall and settle without evaporating.", 500);
 
-                ImGui.SliderFloat("Gravity strength", ref App.worldHandler.worldData.sparseFluidHandler.gravityStrength, 0f, 100f);
+                ImGui.SliderFloat("Gravity strength", ref App.worldHandler.worldData.sparseFluidHandler.solver.gravityStrength, 0f, 100f);
                 ImGuiCommon.HelperIcon("Downward acceleration, same arbitrary unit scale as the other two arms. Default (20) matches both.", 500);
                 // Band width / reinit interval sliders removed (2026-09-04): those only meant something for the
                 // arm's original narrow-band level-set design. The current Volume-of-Fluid design tracks exactly
                 // whichever cells hold fill > 0, with no separate band or periodic reinitialization step at all.
 
-                ImGui.SliderFloat("Velocity damping / sec", ref App.worldHandler.worldData.sparseFluidHandler.velocityDampingPerSecond, 0f, 1f);
+                ImGui.SliderFloat("Velocity damping / sec", ref App.worldHandler.worldData.sparseFluidHandler.solver.velocityDampingPerSecond, 0f, 1f);
                 ImGuiCommon.HelperIcon("Fraction of velocity retained per second (1 = no damping/frictionless, lower = more viscous). Pressure projection alone only stops motion INTO a wall (free-slip), not sliding along one - without this a settled puddle can slosh along the floor forever instead of coming to rest.", 500);
 
-                ImGui.SliderInt("Stagnant ticks before destroy", ref App.worldHandler.worldData.sparseFluidHandler.stagnantTicksBeforeDestroy, 1, 120);
+                ImGui.SliderInt("Stagnant ticks before destroy", ref App.worldHandler.worldData.sparseFluidHandler.solver.stagnantTicksBeforeDestroy, 1, 300);
                 ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it's destroyed. Too low and a splash gets whittled away before it can consolidate into a resting puddle; too high and a genuinely thinning film on open ground lingers longer, tracked but invisible, before cleanup.", 500);
+
+                ImGui.Separator();
+                ImGui.Text("Emitters (T = tap, J = sprinkler)");
+
+                ImGui.SliderFloat("Emitter speed", ref App.worldHandler.worldData.sparseFluidHandler.emitterSpeed, 0f, 30f);
+                ImGuiCommon.HelperIcon("Launch speed of all emitters, in voxels/s. Speeds above ~31 are capped by the per-tick velocity clamp.", 500);
+
+                ImGui.SliderFloat("Sprinkler arc", ref App.worldHandler.worldData.sparseFluidHandler.sprinklerArcDegrees, 0f, 360f);
+                ImGui.SliderFloat("Sprinkler sweep speed", ref App.worldHandler.worldData.sparseFluidHandler.sprinklerAngularSpeedDegPerSec, 0f, 360f);
+                ImGui.SliderFloat("Sprinkler tilt", ref App.worldHandler.worldData.sparseFluidHandler.sprinklerTiltDegrees, 0f, 89f);
+                ImGuiCommon.HelperIcon("Arc (degrees), sweep speed (degrees/s) and upward tilt (degrees) shared by all sprinklers.", 500);
+
+                if (ImGui.Button("Remove all emitters"))
+                    App.worldHandler.worldData.sparseFluidHandler.RemoveAllEmitters();
             }
         }
     }
