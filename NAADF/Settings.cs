@@ -90,6 +90,7 @@ namespace NAADF
     public class SettingDataFluid
     {
         public FluidSimulationMode mode = FluidSimulationMode.None;
+        private int basinFillDepth = 4;
 
         public void RenderImGui()
         {
@@ -109,6 +110,11 @@ namespace NAADF
             if (ImGui.Button("Build pit floor"))
                 App.worldHandler.BuildPitTestFloor();
             ImGuiCommon.HelperIcon("A 20x20 inverted (stepped) pyramid - deepest at the center, sloping up to a walled rim - for testing genuinely RESTING fluid rather than an ever-spreading film on open ground. Aim near the center when seeding so the fluid drops into the deepest point. Best used right after \"Load empty test scene\".", 500);
+
+            ImGui.SameLine();
+            if (ImGui.Button("Build basin floor"))
+                App.worldHandler.BuildBasinTestFloor();
+            ImGuiCommon.HelperIcon("A 256x256 flat-bottomed open box with 32-voxel walls, 200 voxels straight ahead of the pit, for testing large volumes of fluid. Holds about 2.1 million cells when full. Best used right after \"Load empty test scene\".", 500);
 
             ImGui.SameLine();
             if (ImGui.Button("Load oasis scene"))
@@ -133,7 +139,7 @@ namespace NAADF
                 }
                 ImGui.EndCombo();
             }
-            ImGuiCommon.HelperIcon("Switches the fluid comparison approach in use. Clears whatever the previous approach drew and seeds the new one with a fixed starting scenario.", 500);
+            ImGuiCommon.HelperIcon("Switches the fluid comparison approach in use. Clears whatever the previous approach drew and seeds the new one with a fixed starting scenario. Sparse Eulerian starts empty: P drops a blob, T and J place emitters.", 500);
 
             if (mode == FluidSimulationMode.DenseEulerian)
             {
@@ -184,7 +190,7 @@ namespace NAADF
                 ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it's destroyed. Too low and a splash gets whittled away before it can consolidate into a resting puddle; too high and a genuinely thinning film on open ground lingers longer, tracked but invisible, before cleanup.", 500);
 
                 ImGui.Separator();
-                ImGui.Text("Emitters (T = tap, J = sprinkler)");
+                ImGui.Text("P = drop a blob, T = tap, J = sprinkler");
 
                 ImGui.SliderFloat("Emitter speed", ref App.worldHandler.worldData.sparseFluidHandler.emitterSpeed, 0f, 30f);
                 ImGuiCommon.HelperIcon("Launch speed of all emitters, in voxels/s. Speeds above ~31 are capped by the per-tick velocity clamp.", 500);
@@ -196,6 +202,16 @@ namespace NAADF
 
                 if (ImGui.Button("Remove all emitters"))
                     App.worldHandler.worldData.sparseFluidHandler.RemoveAllEmitters();
+
+                ImGui.Separator();
+                ImGui.SliderInt("Basin fill depth", ref basinFillDepth, 1, NAADF.World.WorldHandler.basinWallHeight);
+                ImGui.SameLine();
+                if (ImGui.Button("Fill basin"))
+                {
+                    App.worldHandler.GetBasinInterior(out NAADF.Common.Point3 basinMin, out NAADF.Common.Point3 basinMax);
+                    App.worldHandler.worldData.sparseFluidHandler.SeedBox(basinMin, new NAADF.Common.Point3(basinMax.X, basinMin.Y + basinFillDepth - 1, basinMax.Z));
+                }
+                ImGuiCommon.HelperIcon("Fills the basin wall to wall with resting fluid up to the chosen depth (65,536 cells per layer). Needs \"Build basin floor\" first.", 500);
             }
         }
     }

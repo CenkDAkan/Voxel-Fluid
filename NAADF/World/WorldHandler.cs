@@ -67,9 +67,18 @@ namespace NAADF.World
 
         private static readonly Point3 flatSceneAnchor = new Point3(2048, 200, 2048);
 
+        // Flushes pending GPU changes and forgets freed block/voxel slots, ahead of regenerating the current world in place
+        private void ResetEditStateForRegeneration()
+        {
+            worldData.changeHandler.UpdateWorld();
+            worldData.freeVoxelSlots.Clear();
+            worldData.freeBlockSlots.Clear();
+        }
+
         public void LoadEmptyTestScene()
         {
             worldData.ApplyFluidSimulationMode(FluidSimulationMode.None);
+            ResetEditStateForRegeneration();
             worldData.GenerateWorld(new WorldGeneratorEmpty());
 
             WorldRender.camera.SetPos(new Vector3(flatSceneAnchor.X, flatSceneAnchor.Y + 40, flatSceneAnchor.Z));
@@ -80,6 +89,7 @@ namespace NAADF.World
         public void LoadOasisScene()
         {
             worldData.ApplyFluidSimulationMode(FluidSimulationMode.None);
+            ResetEditStateForRegeneration();
             LoadModelScene("Content\\oasis.cvox");
 
             WorldRender.camera.SetPos(new Vector3(500, 200, 40));
@@ -186,6 +196,38 @@ namespace NAADF.World
                         for (int y = floorTopY + 1; y <= floorTopY + wallHeight; y++)
                             CarveTestFloorVoxel(new Point3(x, y, z));
                     }
+                }
+
+            worldData.editingHandler.processChunks(false);
+        }
+
+        private static readonly Point3 basinAnchor = new Point3(2048, 200, 2248);
+        private const int basinInteriorHalfExtent = 128; // 256x256 open interior
+        private const int basinWallThickness = 4;
+        public const int basinWallHeight = 32;
+
+        // First and last interior cell of the basin (bounds inclusive)
+        public void GetBasinInterior(out Point3 min, out Point3 max)
+        {
+            min = new Point3(basinAnchor.X - basinInteriorHalfExtent, basinAnchor.Y + 1, basinAnchor.Z - basinInteriorHalfExtent);
+            max = new Point3(basinAnchor.X + basinInteriorHalfExtent - 1, basinAnchor.Y + basinWallHeight, basinAnchor.Z + basinInteriorHalfExtent - 1);
+        }
+
+        // A large flat-bottomed open box, 200 voxels in front of the pit, for testing large volumes of fluid
+        public void BuildBasinTestFloor()
+        {
+            EnsureTestFloorTypeRegistered();
+
+            const int floorThickness = 4;
+            GetBasinInterior(out Point3 interiorMin, out Point3 interiorMax);
+
+            for (int x = interiorMin.X - basinWallThickness; x <= interiorMax.X + basinWallThickness; x++)
+                for (int z = interiorMin.Z - basinWallThickness; z <= interiorMax.Z + basinWallThickness; z++)
+                {
+                    bool interior = x >= interiorMin.X && x <= interiorMax.X && z >= interiorMin.Z && z <= interiorMax.Z;
+                    int topY = interior ? basinAnchor.Y : basinAnchor.Y + basinWallHeight;
+                    for (int y = basinAnchor.Y - floorThickness + 1; y <= topY; y++)
+                        CarveTestFloorVoxel(new Point3(x, y, z));
                 }
 
             worldData.editingHandler.processChunks(false);

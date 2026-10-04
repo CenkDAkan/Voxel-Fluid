@@ -11,6 +11,7 @@ namespace NAADF.World.Data
     * Per tick: gravity -> velocity advection -> sources -> pressure projection -> supported-air velocities -> fill transport -> pruning -> damping/clamp
     * A cell counts as liquid for the pressure solve when fill >= liquidThreshold; every other non-solid cell is air
     * Solid geometry is queried through the isSolid delegate supplied by the owner
+    * Cells for which the optional isDrain delegate returns true are emptied every tick, acting as an open outflow
     */
     public class SparseFluidSolver
     {
@@ -20,14 +21,40 @@ namespace NAADF.World.Data
             public Vector3 velocity;
         }
 
+        private struct Transfer
+        {
+            public int donor, receiver;
+            public float amount;
+        }
+
+        private struct FaceUpdate
+        {
+            public int axis, index;
+            public Point3 lower;
+            public float value;
+        }
+
         public readonly SparseFluidGrid grid = new SparseFluidGrid();
 
         private readonly Func<Point3, bool> isSolid;
-        private readonly Dictionary<long, bool> solidCache = new Dictionary<long, bool>();
-        private readonly HashSet<long> sourceCells = new HashSet<long>();
-        private readonly HashSet<long> gainedFillThisTick = new HashSet<long>();
-        private Dictionary<long, float> pressure = new Dictionary<long, float>();
-        private HashSet<long> liquidCells = new HashSet<long>();
+        private readonly Func<Point3, bool> isDrain;
+        private readonly Dictionary<long, bool> solidOutsideBricks = new Dictionary<long, bool>();
+
+        private const byte FlagLiquid = 1, FlagSource = 2, FlagGained = 4, FlagTouched = 8;
+
+        // Cell indices carrying a flag, kept so the flags can be cleared without sweeping the grid
+        private readonly List<int> sourceList = new List<int>();
+        private List<int> liquidList = new List<int>(), previousLiquidList = new List<int>();
+        private readonly List<int> gainedList = new List<int>();
+        private readonly List<int> touchedList = new List<int>();
+        private readonly List<Transfer> transfers = new List<Transfer>();
+        private readonly List<FaceUpdate> faceUpdates = new List<FaceUpdate>();
+
+        // Pressure system buffers, grown as needed and reused across ticks
+        private int[] neighbor = new int[0];
+        private float[] airWeight = new float[0];
+        private float[] diag = new float[0];
+        private double[] b = new double[0], x = new double[0], r = new double[0], z = new double[0], s = new double[0], q = new double[0];
 
         public const float visibilityThreshold = 0.5f;
         public const float liquidThreshold = 0.5f;
@@ -52,15 +79,16 @@ namespace NAADF.World.Data
         public float compactionRate = 0.05f; // fraction of a liquid cell's missing fill drawn in per tick
 
         // Diagnostics
-        public int lastPrunedBySolid, lastPrunedByEmpty;
+        public int lastPrunedBySolid, lastPrunedByEmpty, lastDrained;
         public int lastLiquidCells, lastPressureIterations;
         public float lastPressureResidual;
         public float volumeInjected, volumeClampedAway, volumeClampCreated;
-        public float volumePrunedSolid, volumePrunedEmpty, volumePrunedStagnant;
+        public float volumePrunedSolid, volumePrunedEmpty, volumePrunedStagnant, volumeDrained;
 
-        public SparseFluidSolver(Func<Point3, bool> isSolid)
+        public SparseFluidSolver(Func<Point3, bool> isSolid, Func<Point3, bool> isDrain = null)
         {
             this.isSolid = isSolid;
+            this.isDrain = isDrain;
         }
 
         public int Count => grid.Count;
@@ -68,8 +96,11 @@ namespace NAADF.World.Data
         public void Clear()
         {
             grid.Clear();
-            pressure.Clear();
-            solidCache.Clear();
+            solidOutsideBricks.Clear();
+            sourceList.Clear();
+            liquidList.Clear();
+            previousLiquidList.Clear();
+            gainedList.Clear();
         }
 
         public void RemoveCell(Point3 p) => grid.RemoveKey(SparseFluidGrid.Key(p));
@@ -77,21 +108,31 @@ namespace NAADF.World.Data
         public float TotalVolume()
         {
             float volume = 0f;
-            foreach (long key in grid.SnapshotKeys())
-                volume += grid.GetFill(key);
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
+                volume += grid.fill[i];
             return volume;
+        }
+
+        // Pressure from the last solve; false for cells that weren't liquid in it
+        public bool TryGetPressure(Point3 p, out float value)
+        {
+            int index = grid.CellIndex(p);
+            bool liquid = index >= 0 && grid.liquidIndex[index] != 0;
+            value = liquid ? grid.pressure[index] : 0f;
+            return liquid;
         }
 
         public void ClearVolumeAccumulators()
         {
             volumeInjected = volumeClampedAway = volumeClampCreated = 0f;
-            volumePrunedSolid = volumePrunedEmpty = volumePrunedStagnant = 0f;
+            volumePrunedSolid = volumePrunedEmpty = volumePrunedStagnant = volumeDrained = 0f;
         }
 
         // Fills a sphere with fill-fraction data at rest; cells inside solid are skipped
         public void SeedSphere(Point3 center, int radius)
         {
-            solidCache.Clear();
+            ClearSolidCache();
             int bound = radius + 1;
             for (int x = -bound; x <= bound; x++)
                 for (int y = -bound; y <= bound; y++)
@@ -110,9 +151,28 @@ namespace NAADF.World.Data
                     }
         }
 
+        // Fills every non-solid cell of a box (bounds inclusive) completely, at rest
+        public void SeedBox(Point3 min, Point3 max)
+        {
+            ClearSolidCache();
+            for (int z = min.Z; z <= max.Z; z++)
+                for (int y = min.Y; y <= max.Y; y++)
+                    for (int x = min.X; x <= max.X; x++)
+                    {
+                        Point3 pos = new Point3(x, y, z);
+                        int index = grid.EnsureCellIndex(pos);
+                        if (IsSolid(index, pos))
+                            continue;
+
+                        grid.Track(index);
+                        grid.fill[index] = 1f;
+                        grid.ticksStagnant[index] = 0;
+                    }
+        }
+
         public void Step(float dt, IReadOnlyList<Source> sources)
         {
-            solidCache.Clear();
+            BeginTick();
 
             if (enableGravity)
                 ApplyGravity(dt);
@@ -126,65 +186,116 @@ namespace NAADF.World.Data
             ClampVelocity(dt);
         }
 
-        public bool IsSolid(Point3 p)
+        // Brings the brick layout in line with where the fluid is and forgets last tick's solid lookups
+        private void BeginTick()
         {
+            grid.UpdateTopology();
+            ClearSolidCache();
+        }
+
+        private void ClearSolidCache()
+        {
+            Array.Clear(grid.solid, 0, grid.SlotCount * SparseFluidGrid.BrickCells);
+            solidOutsideBricks.Clear();
+        }
+
+        public bool IsSolid(Point3 p) => IsSolid(grid.CellIndex(p), p);
+
+        // index is the cell's index, or -1 when no brick covers it
+        private bool IsSolid(int index, Point3 p)
+        {
+            if (index >= 0)
+            {
+                byte state = grid.solid[index];
+                if (state == 0)
+                {
+                    state = isSolid(p) ? (byte)2 : (byte)1;
+                    grid.solid[index] = state;
+                }
+                return state == 2;
+            }
+
             long key = SparseFluidGrid.Key(p);
-            if (!solidCache.TryGetValue(key, out bool solid))
+            if (!solidOutsideBricks.TryGetValue(key, out bool solid))
             {
                 solid = isSolid(p);
-                solidCache[key] = solid;
+                solidOutsideBricks[key] = solid;
             }
             return solid;
         }
 
-        private bool IsLiquid(long key, Point3 pos)
+        // Index of the cell one step from a cell that may itself lie outside every brick (index -1)
+        private int StepIndex(int index, Point3 target, int axis, int direction)
         {
-            return grid.TryGetCell(key, out SparseFluidGrid.Cell cell) && cell.fill >= liquidThreshold
-                && !sourceCells.Contains(key) && !IsSolid(pos);
+            return index >= 0 ? grid.NeighborIndex(index, axis, direction) : grid.CellIndex(target);
         }
 
         private void ApplyGravity(float dt)
         {
-            Dictionary<long, float> faceY = grid.faces[1];
+            float[] faceY = grid.face[1];
+            byte[] present = grid.facePresent[1];
             float dv = gravityStrength * dt;
-            foreach (long key in new List<long>(faceY.Keys))
-                faceY[key] -= dv;
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
+                if (present[i] != 0)
+                    faceY[i] -= dv;
         }
 
         // Semi-Lagrangian: every face of every tracked cell takes the velocity found by tracing back from its center
         private void AdvectVelocity(float dt)
         {
-            long[] keys = grid.SnapshotKeys();
-            Dictionary<long, float>[] advected = new Dictionary<long, float>[3];
-
-            for (int axis = 0; axis < 3; axis++)
+            byte[] tracked = grid.tracked;
+            for (int slot = 0; slot < grid.SlotCount; slot++)
             {
-                Point3 offset = SparseFluidGrid.AxisOffsets[axis];
-                HashSet<long> faceKeys = new HashSet<long>();
-                foreach (long key in keys)
-                {
-                    faceKeys.Add(key);
-                    faceKeys.Add(SparseFluidGrid.Key(SparseFluidGrid.Unpack(key) - offset));
-                }
+                if (!grid.IsSlotAllocated(slot))
+                    continue;
 
-                Vector3 half = offset.ToVector3() * 0.5f;
-                Dictionary<long, float> result = new Dictionary<long, float>(faceKeys.Count);
-                foreach (long faceKey in faceKeys)
+                Point3 origin = grid.SlotOrigin(slot);
+                int start = slot << SparseFluidGrid.CellShift;
+                int presentCount = 0;
+                for (int local = 0; local < SparseFluidGrid.BrickCells; local++)
                 {
-                    Vector3 facePos = SparseFluidGrid.Unpack(faceKey).ToVector3() + half;
-                    Vector3 backPos = facePos - grid.SampleVelocity(facePos) * dt;
-                    result[faceKey] = grid.SampleComponent(axis, backPos);
+                    int i = start + local;
+                    Vector3 cellPos = new Vector3(
+                        origin.X + (local & SparseFluidGrid.BrickMask),
+                        origin.Y + ((local >> SparseFluidGrid.BrickShift) & SparseFluidGrid.BrickMask),
+                        origin.Z + (local >> (SparseFluidGrid.BrickShift * 2)));
+
+                    for (int axis = 0; axis < 3; axis++)
+                    {
+                        bool active = tracked[i] != 0;
+                        if (!active)
+                        {
+                            int upper = grid.NeighborIndex(i, axis, 1);
+                            active = upper >= 0 && tracked[upper] != 0;
+                        }
+
+                        if (!active)
+                        {
+                            grid.faceScratch[axis][i] = 0f;
+                            grid.facePresent[axis][i] = 0;
+                            continue;
+                        }
+
+                        Vector3 facePos = cellPos + SparseFluidGrid.AxisOffsets[axis].ToVector3() * 0.5f;
+                        Vector3 backPos = facePos - grid.SampleVelocity(facePos, slot) * dt;
+                        grid.faceScratch[axis][i] = grid.SampleComponent(axis, backPos, slot);
+                        grid.facePresent[axis][i] = 1;
+                        presentCount++;
+                    }
                 }
-                advected[axis] = result;
+                grid.brickFacesPresent[slot] = presentCount;
             }
 
-            grid.faces = advected;
+            (grid.face, grid.faceScratch) = (grid.faceScratch, grid.face);
         }
 
         // Source cells are held full, and all their faces are held at the source velocity through the pressure solve
         private void ApplySources(IReadOnlyList<Source> sources)
         {
-            sourceCells.Clear();
+            foreach (int index in sourceList)
+                grid.flags[index] &= unchecked((byte)~FlagSource);
+            sourceList.Clear();
             if (sources == null)
                 return;
 
@@ -193,34 +304,39 @@ namespace NAADF.World.Data
                 if (IsSolid(source.cell))
                     continue;
 
-                long key = SparseFluidGrid.Key(source.cell);
-                SparseFluidGrid.Cell cell = grid.GetCell(key);
-                volumeInjected += 1f - cell.fill;
-                cell.fill = 1f;
-                cell.ticksStagnant = 0;
-                grid.SetCell(key, cell);
+                int index = grid.EnsureCellIndex(source.cell);
+                volumeInjected += 1f - grid.fill[index];
+                grid.Track(index);
+                grid.fill[index] = 1f;
+                grid.ticksStagnant[index] = 0;
 
                 for (int axis = 0; axis < 3; axis++)
                 {
                     float component = axis == 0 ? source.velocity.X : (axis == 1 ? source.velocity.Y : source.velocity.Z);
-                    grid.faces[axis][key] = component;
-                    grid.faces[axis][SparseFluidGrid.Key(source.cell - SparseFluidGrid.AxisOffsets[axis])] = component;
+                    grid.SetFaceAt(axis, index, component);
+                    grid.SetFace(axis, source.cell - SparseFluidGrid.AxisOffsets[axis], component);
                 }
-                sourceCells.Add(key);
+                grid.flags[index] |= FlagSource;
+                sourceList.Add(index);
             }
         }
 
         private void ZeroSolidFaces()
         {
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
             for (int axis = 0; axis < 3; axis++)
             {
                 Point3 offset = SparseFluidGrid.AxisOffsets[axis];
-                Dictionary<long, float> f = grid.faces[axis];
-                foreach (long faceKey in new List<long>(f.Keys))
+                byte[] present = grid.facePresent[axis];
+                float[] f = grid.face[axis];
+                for (int i = 0; i < end; i++)
                 {
-                    Point3 lower = SparseFluidGrid.Unpack(faceKey);
-                    if (IsSolid(lower) || IsSolid(lower + offset))
-                        f[faceKey] = 0f;
+                    if (present[i] == 0)
+                        continue;
+
+                    Point3 lower = grid.CellPosition(i);
+                    if (IsSolid(i, lower) || IsSolid(grid.NeighborIndex(i, axis, 1), lower + offset))
+                        f[i] = 0f;
                 }
             }
         }
@@ -233,61 +349,86 @@ namespace NAADF.World.Data
         {
             ZeroSolidFaces();
 
-            List<long> liquidKeys = new List<long>();
-            foreach (long key in grid.SnapshotKeys())
-                if (IsLiquid(key, SparseFluidGrid.Unpack(key)))
-                    liquidKeys.Add(key);
+            // Last tick's liquid cells keep their pressure, as the warm start, until the new system has read it
+            (liquidList, previousLiquidList) = (previousLiquidList, liquidList);
+            foreach (int index in previousLiquidList)
+            {
+                grid.flags[index] &= unchecked((byte)~FlagLiquid);
+                grid.liquidIndex[index] = 0;
+            }
+            liquidList.Clear();
 
-            int n = liquidKeys.Count;
-            liquidCells = new HashSet<long>(liquidKeys);
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
+            {
+                if (grid.tracked[i] == 0 || grid.fill[i] < liquidThreshold || (grid.flags[i] & FlagSource) != 0)
+                    continue;
+                if (IsSolid(i, grid.CellPosition(i)))
+                    continue;
+
+                liquidList.Add(i);
+                grid.flags[i] |= FlagLiquid;
+                grid.liquidIndex[i] = liquidList.Count;
+            }
+
+            int n = liquidList.Count;
             lastLiquidCells = n;
             lastPressureIterations = 0;
             lastPressureResidual = 0f;
             if (n == 0)
             {
-                pressure.Clear();
+                foreach (int index in previousLiquidList)
+                    grid.pressure[index] = 0f;
                 return;
             }
 
-            Dictionary<long, int> index = new Dictionary<long, int>(n);
-            for (int i = 0; i < n; i++)
-                index[liquidKeys[i]] = i;
+            if (diag.Length < n)
+            {
+                int capacity = Math.Max(n, diag.Length * 2);
+                neighbor = new int[capacity * 6];
+                airWeight = new float[capacity * 6];
+                diag = new float[capacity];
+                b = new double[capacity];
+                x = new double[capacity];
+                r = new double[capacity];
+                z = new double[capacity];
+                s = new double[capacity];
+                q = new double[capacity];
+            }
 
             // neighbor[i*6+d]: liquid index, -1 air, -2 solid/source; direction d = axis*2 + (0 = +, 1 = -)
-            int[] neighbor = new int[n * 6];
-            float[] airWeight = new float[n * 6];
-            float[] diag = new float[n];
-            double[] b = new double[n];
-
             for (int i = 0; i < n; i++)
             {
-                Point3 pos = SparseFluidGrid.Unpack(liquidKeys[i]);
-                float fill = grid.GetFill(liquidKeys[i]);
+                int cell = liquidList[i];
+                Point3 pos = grid.CellPosition(cell);
+                float fill = grid.fill[cell];
                 float diagonal = 0f;
                 float divergence = 0f;
                 for (int axis = 0; axis < 3; axis++)
                 {
                     Point3 offset = SparseFluidGrid.AxisOffsets[axis];
-                    divergence += grid.GetFace(axis, liquidKeys[i]) - grid.GetFace(axis, SparseFluidGrid.Key(pos - offset));
+                    int lowerCell = grid.NeighborIndex(cell, axis, -1);
+                    divergence += grid.face[axis][cell] - (lowerCell >= 0 ? grid.face[axis][lowerCell] : 0f);
 
                     for (int side = 0; side < 2; side++)
                     {
                         Point3 np = side == 0 ? pos + offset : pos - offset;
-                        long nKey = SparseFluidGrid.Key(np);
+                        int nCell = side == 0 ? grid.NeighborIndex(cell, axis, 1) : lowerCell;
                         int type;
-                        if (IsSolid(np) || sourceCells.Contains(nKey))
+                        if (IsSolid(nCell, np) || (nCell >= 0 && (grid.flags[nCell] & FlagSource) != 0))
                             type = -2;
-                        else if (index.TryGetValue(nKey, out int ni))
-                            type = ni;
+                        else if (nCell >= 0 && grid.liquidIndex[nCell] != 0)
+                            type = grid.liquidIndex[nCell] - 1;
                         else
                             type = -1;
 
                         neighbor[i * 6 + axis * 2 + side] = type;
+                        airWeight[i * 6 + axis * 2 + side] = 0f;
                         if (type >= 0)
                             diagonal += 1f;
                         else if (type == -1)
                         {
-                            float nFill = grid.GetFill(nKey);
+                            float nFill = nCell >= 0 ? grid.fill[nCell] : 0f;
                             float theta = MathHelper.Clamp((fill - liquidThreshold) / MathF.Max(fill - nFill, 1e-6f), minInterfaceTheta, 1f);
                             airWeight[i * 6 + axis * 2 + side] = 1f / theta;
                             diagonal += 1f / theta;
@@ -297,69 +438,70 @@ namespace NAADF.World.Data
                 diag[i] = diagonal > 0f ? diagonal : 1f;
                 float targetDivergence = -compactionRate * (1f - fill) / dt;
                 b[i] = targetDivergence - divergence;
+                x[i] = grid.pressure[cell];
             }
 
-            double[] x = new double[n];
-            for (int i = 0; i < n; i++)
-                x[i] = pressure.TryGetValue(liquidKeys[i], out float p) ? p : 0f;
+            SolvePressure(n);
 
-            SolvePressure(neighbor, diag, b, x);
-
-            Dictionary<long, float> newPressure = new Dictionary<long, float>(n);
+            foreach (int index in previousLiquidList)
+                grid.pressure[index] = 0f;
             for (int i = 0; i < n; i++)
-                newPressure[liquidKeys[i]] = (float)x[i];
-            pressure = newPressure;
+                grid.pressure[liquidList[i]] = (float)x[i];
 
             // u -= p(upper) - p(lower) on every face bordering liquid that isn't solid/source; liquid-liquid faces are handled once, from their lower cell
             for (int i = 0; i < n; i++)
             {
-                Point3 pos = SparseFluidGrid.Unpack(liquidKeys[i]);
+                int cell = liquidList[i];
                 for (int axis = 0; axis < 3; axis++)
                 {
-                    Point3 offset = SparseFluidGrid.AxisOffsets[axis];
-
                     int up = neighbor[i * 6 + axis * 2];
                     if (up != -2)
                     {
                         double pUp = up >= 0 ? x[up] : 0.0;
                         double weight = up >= 0 ? 1.0 : airWeight[i * 6 + axis * 2];
-                        grid.faces[axis][liquidKeys[i]] = grid.GetFace(axis, liquidKeys[i]) - (float)((pUp - x[i]) * weight);
+                        grid.SetFaceAt(axis, cell, grid.face[axis][cell] - (float)((pUp - x[i]) * weight));
                     }
 
                     int down = neighbor[i * 6 + axis * 2 + 1];
                     if (down == -1)
                     {
-                        long faceKey = SparseFluidGrid.Key(pos - offset);
-                        grid.faces[axis][faceKey] = grid.GetFace(axis, faceKey) - (float)(x[i] * airWeight[i * 6 + axis * 2 + 1]);
+                        int lowerCell = grid.NeighborIndex(cell, axis, -1);
+                        if (lowerCell < 0)
+                            lowerCell = grid.EnsureCellIndex(grid.CellPosition(cell) - SparseFluidGrid.AxisOffsets[axis]);
+                        grid.SetFaceAt(axis, lowerCell, grid.face[axis][lowerCell] - (float)(x[i] * airWeight[i * 6 + axis * 2 + 1]));
                     }
                 }
             }
+        }
+
+        private bool IsFluidCell(int index) => index >= 0 && (grid.flags[index] & (FlagLiquid | FlagSource)) != 0;
+
+        // A face the pressure solve has made consistent: not against solid, and bordering a liquid or source cell
+        private bool IsValidFace(int axis, int lowerIndex, Point3 lower)
+        {
+            Point3 upper = lower + SparseFluidGrid.AxisOffsets[axis];
+            int upperIndex = StepIndex(lowerIndex, upper, axis, 1);
+            if (IsSolid(lowerIndex, lower) || IsSolid(upperIndex, upper))
+                return false;
+            return IsFluidCell(lowerIndex) || IsFluidCell(upperIndex);
         }
 
         // Below-threshold cells resting directly on liquid or solid take the velocity of the liquid around them on their free faces
         // (zero when resting on solid alone), so gravity can't build up on them; unsupported cells keep their own ballistic velocity
         private void ExtrapolateIntoSupportedAir()
         {
-            bool IsFluidCell(long key) => liquidCells.Contains(key) || sourceCells.Contains(key);
-
-            bool IsValidFace(int axis, long faceKey)
+            faceUpdates.Clear();
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
             {
-                Point3 lower = SparseFluidGrid.Unpack(faceKey);
-                Point3 upper = lower + SparseFluidGrid.AxisOffsets[axis];
-                if (IsSolid(lower) || IsSolid(upper))
-                    return false;
-                return IsFluidCell(faceKey) || IsFluidCell(SparseFluidGrid.Key(upper));
-            }
-
-            List<(int axis, long faceKey, float value)> updates = new List<(int, long, float)>();
-            foreach (long key in grid.SnapshotKeys())
-            {
-                if (IsFluidCell(key) || grid.GetFill(key) <= 0f)
+                if (grid.tracked[i] == 0 || IsFluidCell(i) || grid.fill[i] <= 0f)
                     continue;
 
-                Point3 pos = SparseFluidGrid.Unpack(key);
+                Point3 pos = grid.CellPosition(i);
                 Point3 below = pos - SparseFluidGrid.AxisOffsets[1];
-                if (!liquidCells.Contains(SparseFluidGrid.Key(below)) && !IsSolid(below))
+                int belowIndex = grid.NeighborIndex(i, 1, -1);
+                bool belowLiquid = belowIndex >= 0 && (grid.flags[belowIndex] & FlagLiquid) != 0;
+                if (!belowLiquid && !IsSolid(belowIndex, below))
                     continue;
 
                 for (int axis = 0; axis < 3; axis++)
@@ -367,37 +509,39 @@ namespace NAADF.World.Data
                     Point3 offset = SparseFluidGrid.AxisOffsets[axis];
                     for (int side = 0; side < 2; side++)
                     {
-                        long faceKey = side == 0 ? key : SparseFluidGrid.Key(pos - offset);
-                        Point3 lower = SparseFluidGrid.Unpack(faceKey);
-                        if (IsSolid(lower) || IsSolid(lower + offset) || IsValidFace(axis, faceKey))
+                        Point3 lower = side == 0 ? pos : pos - offset;
+                        int lowerIndex = side == 0 ? i : grid.NeighborIndex(i, axis, -1);
+                        int upperIndex = side == 0 ? grid.NeighborIndex(i, axis, 1) : i;
+                        if (IsSolid(lowerIndex, lower) || IsSolid(upperIndex, lower + offset) || IsValidFace(axis, lowerIndex, lower))
                             continue;
 
                         float sum = 0f;
                         int count = 0;
-                        foreach (Point3 o in LatticeNeighbors)
+                        for (int d = 0; d < 6; d++)
                         {
-                            long neighborFace = SparseFluidGrid.Key(lower + o);
-                            if (IsValidFace(axis, neighborFace))
+                            Point3 neighborLower = lower + LatticeNeighbors[d];
+                            int neighborIndex = StepIndex(lowerIndex, neighborLower, d >> 1, (d & 1) == 0 ? 1 : -1);
+                            if (IsValidFace(axis, neighborIndex, neighborLower))
                             {
-                                sum += grid.GetFace(axis, neighborFace);
+                                sum += neighborIndex >= 0 ? grid.face[axis][neighborIndex] : 0f;
                                 count++;
                             }
                         }
-                        updates.Add((axis, faceKey, count > 0 ? sum / count : 0f));
+                        faceUpdates.Add(new FaceUpdate { axis = axis, index = lowerIndex, lower = lower, value = count > 0 ? sum / count : 0f });
                     }
                 }
             }
 
-            foreach (var (axis, faceKey, value) in updates)
-                grid.faces[axis][faceKey] = value;
+            foreach (FaceUpdate update in faceUpdates)
+            {
+                int index = update.index >= 0 ? update.index : grid.EnsureCellIndex(update.lower);
+                grid.SetFaceAt(update.axis, index, update.value);
+            }
         }
 
-        // Jacobi-preconditioned conjugate gradient for A p = b, with (A p)_i = diag_i p_i - sum of liquid neighbor p
-        private void SolvePressure(int[] neighbor, float[] diag, double[] b, double[] x)
+        // Jacobi-preconditioned conjugate gradient for A p = b over the first n entries, with (A p)_i = diag_i p_i - sum of liquid neighbor p
+        private void SolvePressure(int n)
         {
-            int n = diag.Length;
-            double[] r = new double[n], z = new double[n], s = new double[n], q = new double[n];
-
             void ApplyA(double[] v, double[] result)
             {
                 for (int i = 0; i < n; i++)
@@ -476,146 +620,181 @@ namespace NAADF.World.Data
         // Bounded: each donor's total outflow is scaled to what it holds, then each receiver's total inflow is scaled to its free space
         private void AdvectFill(float dt)
         {
-            long[] keys = grid.SnapshotKeys();
-            Dictionary<long, float> currentFill = new Dictionary<long, float>(keys.Length);
-            foreach (long key in keys)
-                currentFill[key] = grid.GetFill(key);
-            float FillOf(long key) => currentFill.TryGetValue(key, out float f) ? f : 0f;
+            foreach (int index in gainedList)
+                grid.flags[index] &= unchecked((byte)~FlagGained);
+            gainedList.Clear();
 
-            HashSet<(long lowerKey, int axis)> faceSet = new HashSet<(long, int)>();
-            foreach (long key in keys)
+            // Transfers as (donor, receiver, amount > 0), one per face whose upwind cell holds fluid
+            transfers.Clear();
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
             {
-                Point3 pos = SparseFluidGrid.Unpack(key);
                 for (int axis = 0; axis < 3; axis++)
                 {
-                    faceSet.Add((key, axis));
-                    faceSet.Add((SparseFluidGrid.Key(pos - SparseFluidGrid.AxisOffsets[axis]), axis));
+                    float flux = MathHelper.Clamp(grid.face[axis][i] * dt, -1f, 1f);
+                    if (flux == 0f)
+                        continue;
+
+                    int upper = grid.NeighborIndex(i, axis, 1);
+                    float lowerFill = grid.fill[i];
+                    float upperFill = upper >= 0 ? grid.fill[upper] : 0f;
+                    if (flux > 0f ? lowerFill <= minFillEpsilon : upperFill <= minFillEpsilon)
+                        continue;
+
+                    Point3 lowerPos = grid.CellPosition(i);
+                    Point3 upperPos = lowerPos + SparseFluidGrid.AxisOffsets[axis];
+                    if (IsSolid(i, lowerPos) || IsSolid(upper, upperPos))
+                        continue;
+
+                    if (flux > 0f)
+                    {
+                        if (upper < 0)
+                            upper = grid.EnsureCellIndex(upperPos);
+                        transfers.Add(new Transfer { donor = i, receiver = upper, amount = flux * lowerFill });
+                    }
+                    else
+                        transfers.Add(new Transfer { donor = upper, receiver = i, amount = -flux * upperFill });
                 }
             }
 
-            // Transfers as (donor, receiver, amount > 0)
-            List<(long donor, long receiver, float amount)> transfers = new List<(long, long, float)>();
-            foreach ((long lowerKey, int axis) in faceSet)
-            {
-                Point3 lowerPos = SparseFluidGrid.Unpack(lowerKey);
-                Point3 upperPos = lowerPos + SparseFluidGrid.AxisOffsets[axis];
-                if (IsSolid(lowerPos) || IsSolid(upperPos))
-                    continue;
+            float[] fill = grid.fill, outTotal = grid.outTotal, outScaled = grid.outScaled, inTotal = grid.inTotal, delta = grid.delta;
+            byte[] flags = grid.flags;
+            int count = transfers.Count;
 
-                long upperKey = SparseFluidGrid.Key(upperPos);
-                float flux = MathHelper.Clamp(grid.GetFace(axis, lowerKey) * dt, -1f, 1f);
-                if (flux > 0f && FillOf(lowerKey) > minFillEpsilon)
-                    transfers.Add((lowerKey, upperKey, flux * FillOf(lowerKey)));
-                else if (flux < 0f && FillOf(upperKey) > minFillEpsilon)
-                    transfers.Add((upperKey, lowerKey, -flux * FillOf(upperKey)));
-            }
-
-            Dictionary<long, float> outTotal = new Dictionary<long, float>();
-            foreach (var t in transfers)
-                outTotal[t.donor] = (outTotal.TryGetValue(t.donor, out float o) ? o : 0f) + t.amount;
-            for (int i = 0; i < transfers.Count; i++)
+            for (int k = 0; k < count; k++)
+                outTotal[transfers[k].donor] += transfers[k].amount;
+            for (int k = 0; k < count; k++)
             {
-                var t = transfers[i];
-                float available = FillOf(t.donor);
+                Transfer t = transfers[k];
+                float available = fill[t.donor];
                 float total = outTotal[t.donor];
                 if (total > available)
-                    transfers[i] = (t.donor, t.receiver, t.amount * available / total);
+                {
+                    t.amount = t.amount * available / total;
+                    transfers[k] = t;
+                }
             }
 
-            Dictionary<long, float> outScaled = new Dictionary<long, float>();
-            Dictionary<long, float> inTotal = new Dictionary<long, float>();
-            foreach (var t in transfers)
+            for (int k = 0; k < count; k++)
             {
-                outScaled[t.donor] = (outScaled.TryGetValue(t.donor, out float o) ? o : 0f) + t.amount;
-                inTotal[t.receiver] = (inTotal.TryGetValue(t.receiver, out float n) ? n : 0f) + t.amount;
+                Transfer t = transfers[k];
+                outScaled[t.donor] += t.amount;
+                inTotal[t.receiver] += t.amount;
             }
-            for (int i = 0; i < transfers.Count; i++)
+            for (int k = 0; k < count; k++)
             {
-                var t = transfers[i];
+                Transfer t = transfers[k];
                 float incoming = inTotal[t.receiver];
-                float space = 1f - FillOf(t.receiver) + (outScaled.TryGetValue(t.receiver, out float o) ? o : 0f);
+                float space = 1f - fill[t.receiver] + outScaled[t.receiver];
                 if (incoming > space)
-                    transfers[i] = (t.donor, t.receiver, t.amount * MathF.Max(space, 0f) / incoming);
+                {
+                    t.amount = t.amount * MathF.Max(space, 0f) / incoming;
+                    transfers[k] = t;
+                }
             }
 
-            Dictionary<long, float> delta = new Dictionary<long, float>();
-            void AddDelta(long key, float amount)
+            touchedList.Clear();
+            for (int k = 0; k < count; k++)
             {
-                delta.TryGetValue(key, out float existing);
-                delta[key] = existing + amount;
-            }
-            foreach (var t in transfers)
-            {
-                if (t.amount < minFillEpsilon && FillOf(t.receiver) <= minFillEpsilon)
+                Transfer t = transfers[k];
+                if (t.amount < minFillEpsilon && fill[t.receiver] <= minFillEpsilon)
                     continue; // don't create new cells from negligible amounts
-                AddDelta(t.donor, -t.amount);
-                AddDelta(t.receiver, t.amount);
+
+                delta[t.donor] -= t.amount;
+                delta[t.receiver] += t.amount;
+                if ((flags[t.donor] & FlagTouched) == 0)
+                {
+                    flags[t.donor] |= FlagTouched;
+                    touchedList.Add(t.donor);
+                }
+                if ((flags[t.receiver] & FlagTouched) == 0)
+                {
+                    flags[t.receiver] |= FlagTouched;
+                    touchedList.Add(t.receiver);
+                }
             }
 
-            gainedFillThisTick.Clear();
-            foreach (KeyValuePair<long, float> kvp in delta)
+            foreach (int index in touchedList)
             {
-                SparseFluidGrid.Cell cell = grid.GetCell(kvp.Key);
-                float rawFill = cell.fill + kvp.Value;
+                float rawFill = fill[index] + delta[index];
                 if (rawFill > 1f)
                     volumeClampedAway += rawFill - 1f;
                 else if (rawFill < 0f)
                     volumeClampCreated += -rawFill;
-                cell.fill = MathHelper.Clamp(rawFill, 0f, 1f);
-                grid.SetCell(kvp.Key, cell);
+                grid.Track(index);
+                fill[index] = MathHelper.Clamp(rawFill, 0f, 1f);
 
-                if (kvp.Value > 0f)
-                    gainedFillThisTick.Add(kvp.Key);
+                flags[index] &= unchecked((byte)~FlagTouched);
+                if (delta[index] > 0f)
+                {
+                    flags[index] |= FlagGained;
+                    gainedList.Add(index);
+                }
+                delta[index] = 0f;
+            }
+
+            for (int k = 0; k < count; k++)
+            {
+                outTotal[transfers[k].donor] = 0f;
+                outScaled[transfers[k].donor] = 0f;
+                inTotal[transfers[k].receiver] = 0f;
             }
         }
 
-        // Removes cells inside solid, cells holding (almost) nothing, and dim cells that have stopped gaining fill for too long
+        // Removes cells inside solid or a drain, cells holding (almost) nothing, and dim cells that have stopped gaining fill for too long
         private void PruneStaleCells()
         {
             lastPrunedBySolid = 0;
             lastPrunedByEmpty = 0;
+            lastDrained = 0;
 
-            foreach (long key in grid.SnapshotKeys())
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
             {
-                SparseFluidGrid.Cell cell = grid.GetCell(key);
-                if (IsSolid(SparseFluidGrid.Unpack(key)))
+                if (grid.tracked[i] == 0)
+                    continue;
+
+                float fill = grid.fill[i];
+                Point3 pos = grid.CellPosition(i);
+                if (isDrain != null && isDrain(pos))
                 {
-                    grid.RemoveKey(key);
+                    grid.Untrack(i);
+                    lastDrained++;
+                    volumeDrained += fill;
+                    continue;
+                }
+
+                if (IsSolid(i, pos))
+                {
+                    grid.Untrack(i);
                     lastPrunedBySolid++;
-                    volumePrunedSolid += cell.fill;
+                    volumePrunedSolid += fill;
                     continue;
                 }
 
-                if (cell.fill <= minFillEpsilon)
+                if (fill <= minFillEpsilon)
                 {
-                    grid.RemoveKey(key);
+                    grid.Untrack(i);
                     lastPrunedByEmpty++;
-                    volumePrunedEmpty += cell.fill;
+                    volumePrunedEmpty += fill;
                     continue;
                 }
 
-                bool dim = cell.fill <= visibilityThreshold;
-                bool gained = gainedFillThisTick.Contains(key);
+                bool dim = fill <= visibilityThreshold;
+                bool gained = (grid.flags[i] & FlagGained) != 0;
                 if (!dim || gained)
                 {
-                    if (gained && cell.ticksStagnant != 0)
-                    {
-                        cell.ticksStagnant = 0;
-                        grid.SetCell(key, cell);
-                    }
+                    if (gained)
+                        grid.ticksStagnant[i] = 0;
                     continue;
                 }
 
-                cell.ticksStagnant++;
-                if (cell.ticksStagnant >= stagnantTicksBeforeDestroy)
+                grid.ticksStagnant[i]++;
+                if (grid.ticksStagnant[i] >= stagnantTicksBeforeDestroy)
                 {
-                    grid.RemoveKey(key);
+                    grid.Untrack(i);
                     lastPrunedByEmpty++;
-                    volumePrunedStagnant += cell.fill;
-                }
-                else
-                {
-                    grid.SetCell(key, cell);
+                    volumePrunedStagnant += fill;
                 }
             }
         }
@@ -626,18 +805,20 @@ namespace NAADF.World.Data
                 return;
 
             float factor = MathF.Pow(MathHelper.Clamp(velocityDampingPerSecond, 0f, 1f), dt);
-            foreach (Dictionary<long, float> f in grid.faces)
-                foreach (long key in new List<long>(f.Keys))
-                    f[key] *= factor;
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            foreach (float[] f in grid.face)
+                for (int i = 0; i < end; i++)
+                    f[i] *= factor;
         }
 
         // No face may carry more than cflMaxFraction of a cell per tick
         private void ClampVelocity(float dt)
         {
             float maxSpeed = cflMaxFraction / dt;
-            foreach (Dictionary<long, float> f in grid.faces)
-                foreach (long key in new List<long>(f.Keys))
-                    f[key] = MathHelper.Clamp(f[key], -maxSpeed, maxSpeed);
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            foreach (float[] f in grid.face)
+                for (int i = 0; i < end; i++)
+                    f[i] = MathHelper.Clamp(f[i], -maxSpeed, maxSpeed);
         }
     }
 }

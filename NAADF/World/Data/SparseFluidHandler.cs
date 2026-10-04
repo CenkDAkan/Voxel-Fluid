@@ -66,7 +66,7 @@ namespace NAADF.World.Data
         public SparseFluidHandler(WorldData worldData)
         {
             this.worldData = worldData;
-            solver = new SparseFluidSolver(IsSolid);
+            solver = new SparseFluidSolver(IsSolid, IsWorldBoundary);
 
             VoxelType sparseEulerianFluidType = new VoxelType
             {
@@ -131,7 +131,7 @@ namespace NAADF.World.Data
             SeedSphere(Point3.FromVector3(camPos + camDir * 20f), 4);
         }
 
-        // Called once when this mode is selected from Settings: seeds a sphere a few voxels above the floor below the aim point
+        // Seeds a sphere a few voxels above the floor below the aim point; no longer called when the mode is selected
         public void SeedDefaultScenario()
         {
             Vector3 camPos = WorldRender.camera.GetPos().toVector3();
@@ -143,6 +143,16 @@ namespace NAADF.World.Data
             lastKnownFloorY = floorY;
 
             SeedSphere(new Point3((int)aimPoint.X, floorY + 6, (int)aimPoint.Z), 4);
+        }
+
+        // Fills a box (bounds inclusive) with fluid at rest, for seeding large volumes at once
+        public void SeedBox(Point3 min, Point3 max)
+        {
+            solver.SeedBox(min, max);
+            ticksSinceSeed = 0;
+            loggedFirstContact = false;
+            ResetVolumeTracking();
+            Console.WriteLine($"SparseFluidHandler: filled box ({min.X}, {min.Y}, {min.Z}) to ({max.X}, {max.Y}, {max.Z}), tracked cells = {solver.Count}, volume = {volumeAtLastLog:F2}.");
         }
 
         private void SeedSphere(Point3 center, int radius)
@@ -199,7 +209,7 @@ namespace NAADF.World.Data
             foreach (Emitter emitter in emitters)
                 WriteCell(emitter.position, false);
             emitters.Clear();
-            worldData.editingHandler.processChunks(false);
+            CommitEdits();
         }
 
         private void PlaceMarkerVoxel(Point3 worldVoxel)
@@ -209,7 +219,7 @@ namespace NAADF.World.Data
 
             uint pointer = worldData.editingHandler.getChunkDataToEdit(chunkPos);
             worldData.editingHandler.setVoxelData(pointer, voxelPosInChunk, (1u << 15) | emitterTypeRenderIndex);
-            worldData.editingHandler.processChunks(false);
+            CommitEdits();
         }
 
         // Advances each sprinkler's sweep and returns every nozzle cell with its emitter's launch velocity
@@ -278,7 +288,7 @@ namespace NAADF.World.Data
                 WriteCell(emitter.position, false);
             emitters.Clear();
 
-            worldData.editingHandler.processChunks(false);
+            CommitEdits();
 
             solver.Clear();
             physicsAccumulatorMs = 0f;
@@ -297,6 +307,21 @@ namespace NAADF.World.Data
         {
             return p.X >= 0 && p.Y >= 0 && p.Z >= 0
                 && p.X < worldData.sizeInVoxels.X && p.Y < worldData.sizeInVoxels.Y && p.Z < worldData.sizeInVoxels.Z;
+        }
+
+        // The outermost voxel layer of the world; fluid reaching it leaves the simulation
+        private bool IsWorldBoundary(Point3 p)
+        {
+            return p.X <= 0 || p.Y <= 0 || p.Z <= 0
+                || p.X >= worldData.sizeInVoxels.X - 1 || p.Y >= worldData.sizeInVoxels.Y - 1 || p.Z >= worldData.sizeInVoxels.Z - 1;
+        }
+
+        // Processes the staged edits and uploads them as a GPU batch of their own, after flushing any batch still pending
+        private void CommitEdits()
+        {
+            if (worldData.changeHandler.changedChunkCount > 0)
+                worldData.changeHandler.UpdateWorld();
+            worldData.editingHandler.processChunks(true);
         }
 
         // Draws cells above the visibility threshold and erases cells that dropped below it or left tracking
@@ -323,7 +348,7 @@ namespace NAADF.World.Data
                 if (WriteCell(SparseFluidGrid.Unpack(key), false))
                     wasFluidVoxel.Remove(key);
 
-            worldData.editingHandler.processChunks(false);
+            CommitEdits();
         }
 
         private bool WriteCell(Point3 worldVoxel, bool visible)
@@ -397,11 +422,11 @@ namespace NAADF.World.Data
 
             string bandYInfo = grid.Count > 0 ? $", Y range = [{minY}, {maxY}]" : "";
             string floorInfo = lastKnownFloorY.HasValue ? $", floorY = {lastKnownFloorY.Value}" : "";
-            Console.WriteLine($"SparseFluidHandler: tick {ticksSinceSeed} ({ticksSinceSeed * physicsIntervalMs / 1000f:F2}s), visible cells = {visibleCellCount}, tracked cells = {grid.Count}, liquid cells = {solver.lastLiquidCells}, total speed = {totalSpeed:F3}, pressure iterations = {solver.lastPressureIterations} (residual {solver.lastPressureResidual:E1}), pruned this tick (solid/empty) = {solver.lastPrunedBySolid}/{solver.lastPrunedByEmpty}, emitters = {emitters.Count}{bandYInfo}{floorInfo}");
+            Console.WriteLine($"SparseFluidHandler: tick {ticksSinceSeed} ({ticksSinceSeed * physicsIntervalMs / 1000f:F2}s), visible cells = {visibleCellCount}, tracked cells = {grid.Count}, liquid cells = {solver.lastLiquidCells}, total speed = {totalSpeed:F3}, pressure iterations = {solver.lastPressureIterations} (residual {solver.lastPressureResidual:E1}), pruned this tick (solid/empty/drained) = {solver.lastPrunedBySolid}/{solver.lastPrunedByEmpty}/{solver.lastDrained}, emitters = {emitters.Count}{bandYInfo}{floorInfo}");
 
-            float expectedChange = solver.volumeInjected + solver.volumeClampCreated - solver.volumeClampedAway - solver.volumePrunedSolid - solver.volumePrunedEmpty - solver.volumePrunedStagnant;
+            float expectedChange = solver.volumeInjected + solver.volumeClampCreated - solver.volumeClampedAway - solver.volumePrunedSolid - solver.volumePrunedEmpty - solver.volumePrunedStagnant - solver.volumeDrained;
             float unaccounted = (totalVolume - volumeAtLastLog) - expectedChange;
-            Console.WriteLine($"    volume = {totalVolume:F2}, since last log: injected +{solver.volumeInjected:F2}, clamp lost -{solver.volumeClampedAway:F3}, clamp created +{solver.volumeClampCreated:F3}, pruned solid -{solver.volumePrunedSolid:F3} / empty -{solver.volumePrunedEmpty:F3} / stagnant -{solver.volumePrunedStagnant:F3}, unaccounted {unaccounted:F3}");
+            Console.WriteLine($"    volume = {totalVolume:F2}, since last log: injected +{solver.volumeInjected:F2}, clamp lost -{solver.volumeClampedAway:F3}, clamp created +{solver.volumeClampCreated:F3}, pruned solid -{solver.volumePrunedSolid:F3} / empty -{solver.volumePrunedEmpty:F3} / stagnant -{solver.volumePrunedStagnant:F3}, drained -{solver.volumeDrained:F3}, unaccounted {unaccounted:F3}");
 
             volumeAtLastLog = totalVolume;
             solver.ClearVolumeAccumulators();
