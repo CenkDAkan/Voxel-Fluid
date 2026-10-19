@@ -121,6 +121,12 @@
 /processorParam:DebugMode=Auto
 /build:shaders/fluid/denseFluidSim.fx
 
+#begin shaders/fluid/sparseFluidSim.fx
+/importer:EffectImporter
+/processor:EffectProcessor
+/processorParam:DebugMode=Auto
+/build:shaders/fluid/sparseFluidSim.fx
+
 #begin shaders/world/data/boundsCalc.fx
 /importer:EffectImporter
 /processor:EffectProcessor

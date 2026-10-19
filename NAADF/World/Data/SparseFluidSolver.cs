@@ -2,6 +2,7 @@ using Microsoft.Xna.Framework;
 using NAADF.Common;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace NAADF.World.Data
 {
@@ -39,6 +40,8 @@ namespace NAADF.World.Data
         private readonly Func<Point3, bool> isSolid;
         private readonly Func<Point3, bool> isDrain;
         private readonly Dictionary<long, bool> solidOutsideBricks = new Dictionary<long, bool>();
+        private const int solidRefreshTicks = 64;
+        private int solidRefreshSlot = 0;
 
         private const byte FlagLiquid = 1, FlagSource = 2, FlagGained = 4, FlagTouched = 8;
 
@@ -58,11 +61,10 @@ namespace NAADF.World.Data
 
         public const float visibilityThreshold = 0.5f;
         public const float liquidThreshold = 0.5f;
-        private const float minFillEpsilon = 0.001f;
-        private const float cflMaxFraction = 0.5f;
-        private const float minInterfaceTheta = 0.05f;
+        public const float minFillEpsilon = 0.001f;
+        public const float cflMaxFraction = 0.5f;
+        public const float minInterfaceTheta = 0.05f;
 
-        private const float pressureTolerance = 1e-4f;
         private const int maxPressureIterations = 300;
 
         private static readonly Point3[] LatticeNeighbors =
@@ -72,6 +74,8 @@ namespace NAADF.World.Data
             new Point3(0, 0, 1), new Point3(0, 0, -1),
         };
 
+        public const float pressureTolerance = 1e-4f;
+
         public bool enableGravity = true;
         public float gravityStrength = 20f;
         public float velocityDampingPerSecond = 0.3f; // fraction of velocity retained per second
@@ -79,20 +83,26 @@ namespace NAADF.World.Data
         public float compactionRate = 0.05f; // fraction of a liquid cell's missing fill drawn in per tick
 
         // Diagnostics
+        public static readonly string[] StageNames = { "BeginTick", "Gravity", "AdvectVelocity", "Sources", "Project", "Extrapolate", "AdvectFill", "Prune", "Damping", "Clamp" };
+        public readonly double[] stageMs = new double[10]; // time spent per stage, accumulated until the owner clears it
         public int lastPrunedBySolid, lastPrunedByEmpty, lastDrained;
         public int lastLiquidCells, lastPressureIterations;
         public float lastPressureResidual;
         public float volumeInjected, volumeClampedAway, volumeClampCreated;
         public float volumePrunedSolid, volumePrunedEmpty, volumePrunedStagnant, volumeDrained;
 
+        // Creates an empty solver; isSolid says which world cells block fluid, the optional isDrain which cells empty themselves
         public SparseFluidSolver(Func<Point3, bool> isSolid, Func<Point3, bool> isDrain = null)
         {
             this.isSolid = isSolid;
             this.isDrain = isDrain;
         }
 
+        // Number of tracked cells
         public int Count => grid.Count;
 
+
+        // Drops all fluid, cached solid lookups and flagged-cell lists
         public void Clear()
         {
             grid.Clear();
@@ -103,11 +113,13 @@ namespace NAADF.World.Data
             gainedList.Clear();
         }
 
+        // Removes the fluid in one cell, if it has any
         public void RemoveCell(Point3 p) => grid.RemoveKey(SparseFluidGrid.Key(p));
 
-        public float TotalVolume()
+        // Sum of the fill of every cell
+        public double TotalVolume()
         {
-            float volume = 0f;
+            double volume = 0.0;
             int end = grid.SlotCount * SparseFluidGrid.BrickCells;
             for (int i = 0; i < end; i++)
                 volume += grid.fill[i];
@@ -123,6 +135,7 @@ namespace NAADF.World.Data
             return liquid;
         }
 
+        // Zeroes the volume bookkeeping that the owner reads and resets between log lines
         public void ClearVolumeAccumulators()
         {
             volumeInjected = volumeClampedAway = volumeClampCreated = 0f;
@@ -170,37 +183,114 @@ namespace NAADF.World.Data
                     }
         }
 
+        // Advances the simulation by one tick on the CPU, timing each stage into stageMs
         public void Step(float dt, IReadOnlyList<Source> sources)
         {
+            long start = Stopwatch.GetTimestamp();
             BeginTick();
+            start = AddStageTime(0, start);
 
             if (enableGravity)
                 ApplyGravity(dt);
+            start = AddStageTime(1, start);
             AdvectVelocity(dt);
+            start = AddStageTime(2, start);
             ApplySources(sources);
+            start = AddStageTime(3, start);
             Project(dt);
+            start = AddStageTime(4, start);
             ExtrapolateIntoSupportedAir();
+            start = AddStageTime(5, start);
             AdvectFill(dt);
+            start = AddStageTime(6, start);
             PruneStaleCells();
+            start = AddStageTime(7, start);
             ApplyDamping(dt);
+            start = AddStageTime(8, start);
             ClampVelocity(dt);
+            AddStageTime(9, start);
         }
 
-        // Brings the brick layout in line with where the fluid is and forgets last tick's solid lookups
-        private void BeginTick()
+        // Adds the time since start to a stage's total and returns the current timestamp, for timing the next stage
+        private long AddStageTime(int stage, long start)
+        {
+            long now = Stopwatch.GetTimestamp();
+            stageMs[stage] += (now - start) * 1000.0 / Stopwatch.Frequency;
+            return now;
+        }
+
+        // Works out the brick borders from the cells, then updates the brick layout
+        public void BeginTick()
+        {
+            grid.ScanBorders();
+            UpdateLayout();
+        }
+
+        // Brings the brick layout in line with where the fluid is, going by the grid's per-brick figures
+        // Solid lookups are kept from tick to tick; a few bricks are forgotten each tick so every brick is re-queried about once a second
+        public void UpdateLayout()
         {
             grid.UpdateTopology();
-            ClearSolidCache();
+            solidOutsideBricks.Clear();
+
+            int slots = grid.SlotCount;
+            int refreshCount = (slots + solidRefreshTicks - 1) / solidRefreshTicks;
+            for (int k = 0; k < refreshCount; k++)
+            {
+                if (solidRefreshSlot >= slots)
+                    solidRefreshSlot = 0;
+                Array.Clear(grid.solid, solidRefreshSlot << SparseFluidGrid.CellShift, SparseFluidGrid.BrickCells);
+                solidRefreshSlot++;
+            }
         }
 
+        // Forgets every cached solid lookup
         private void ClearSolidCache()
         {
             Array.Clear(grid.solid, 0, grid.SlotCount * SparseFluidGrid.BrickCells);
             solidOutsideBricks.Clear();
         }
 
+        // To be called when solid geometry inside a box of cells (bounds inclusive) has changed
+        public void InvalidateSolid(Point3 min, Point3 max)
+        {
+            grid.ClearSolid(min, max);
+            solidOutsideBricks.Clear();
+        }
+
+        // Queries the solid state of every cell of every brick that isn't known yet; returns whether there were any
+        public bool FillSolid()
+        {
+            bool anyUnknown = false;
+            for (int slot = 0; slot < grid.SlotCount; slot++)
+            {
+                if (!grid.IsSlotAllocated(slot))
+                    continue;
+
+                int start = slot << SparseFluidGrid.CellShift;
+                for (int local = 0; local < SparseFluidGrid.BrickCells; local++)
+                    if (grid.solid[start + local] == 0)
+                    {
+                        grid.solid[start + local] = SolidState(grid.CellPosition(start + local));
+                        anyUnknown = true;
+                    }
+            }
+            return anyUnknown;
+        }
+
+        // Queries the owner for a cell's solid and drain state, packed as the grid's solid cache byte
+        private byte SolidState(Point3 p)
+        {
+            byte state = isSolid(p) ? SparseFluidGrid.SolidBlocked : SparseFluidGrid.SolidFree;
+            if (isDrain != null && isDrain(p))
+                state |= SparseFluidGrid.SolidDrain;
+            return state;
+        }
+
+        // Whether the cell at a world position is solid, using the cache
         public bool IsSolid(Point3 p) => IsSolid(grid.CellIndex(p), p);
 
+        // Whether a cell is solid: cached per cell inside bricks, cached for the tick outside them
         // index is the cell's index, or -1 when no brick covers it
         private bool IsSolid(int index, Point3 p)
         {
@@ -209,10 +299,10 @@ namespace NAADF.World.Data
                 byte state = grid.solid[index];
                 if (state == 0)
                 {
-                    state = isSolid(p) ? (byte)2 : (byte)1;
+                    state = SolidState(p);
                     grid.solid[index] = state;
                 }
-                return state == 2;
+                return (state & SparseFluidGrid.SolidBlocked) != 0;
             }
 
             long key = SparseFluidGrid.Key(p);
@@ -230,7 +320,8 @@ namespace NAADF.World.Data
             return index >= 0 ? grid.NeighborIndex(index, axis, direction) : grid.CellIndex(target);
         }
 
-        private void ApplyGravity(float dt)
+        // Accelerates every present vertical face downwards by one tick of gravity
+        public void ApplyGravity(float dt)
         {
             float[] faceY = grid.face[1];
             byte[] present = grid.facePresent[1];
@@ -242,7 +333,7 @@ namespace NAADF.World.Data
         }
 
         // Semi-Lagrangian: every face of every tracked cell takes the velocity found by tracing back from its center
-        private void AdvectVelocity(float dt)
+        public void AdvectVelocity(float dt)
         {
             byte[] tracked = grid.tracked;
             for (int slot = 0; slot < grid.SlotCount; slot++)
@@ -291,7 +382,7 @@ namespace NAADF.World.Data
         }
 
         // Source cells are held full, and all their faces are held at the source velocity through the pressure solve
-        private void ApplySources(IReadOnlyList<Source> sources)
+        public void ApplySources(IReadOnlyList<Source> sources)
         {
             foreach (int index in sourceList)
                 grid.flags[index] &= unchecked((byte)~FlagSource);
@@ -318,9 +409,14 @@ namespace NAADF.World.Data
                 }
                 grid.flags[index] |= FlagSource;
                 sourceList.Add(index);
+
+                // A source cell can appear anywhere mid-tick, so the bricks around it are made sure to exist here
+                foreach (Point3 offset in LatticeNeighbors)
+                    grid.EnsureCellIndex(source.cell + offset);
             }
         }
 
+        // Zeroes the velocity of every present face that touches a solid cell
         private void ZeroSolidFaces()
         {
             int end = grid.SlotCount * SparseFluidGrid.BrickCells;
@@ -345,10 +441,41 @@ namespace NAADF.World.Data
         // except for a small inflow into liquid cells that aren't full, which packs trapped air back out
         // Neighbor rules: liquid = unknown, air = zero pressure at the interface (ghost fluid), solid or source = no flow through the face
         // The interface sits between a liquid and an air cell where fill crosses liquidThreshold, so air faces are weighted by 1/theta
-        private void Project(float dt)
+        public void Project(float dt)
         {
-            ZeroSolidFaces();
+            ClassifyLiquidCells();
+            SolveProjection(dt);
+        }
 
+        // Rebuilds the lists of flagged cells from the flags themselves, after the per-cell arrays were filled in from elsewhere
+        public void RebuildCellLists()
+        {
+            sourceList.Clear();
+            liquidList.Clear();
+            previousLiquidList.Clear();
+            gainedList.Clear();
+
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
+            {
+                byte cellFlags = grid.flags[i];
+                grid.liquidIndex[i] = 0;
+                if ((cellFlags & FlagSource) != 0)
+                    sourceList.Add(i);
+                if ((cellFlags & FlagGained) != 0)
+                    gainedList.Add(i);
+                if ((cellFlags & FlagLiquid) != 0)
+                {
+                    liquidList.Add(i);
+                    grid.liquidIndex[i] = liquidList.Count;
+                }
+            }
+            lastLiquidCells = liquidList.Count;
+        }
+
+        // Decides which cells are liquid for this tick's pressure solve
+        public void ClassifyLiquidCells()
+        {
             // Last tick's liquid cells keep their pressure, as the warm start, until the new system has read it
             (liquidList, previousLiquidList) = (previousLiquidList, liquidList);
             foreach (int index in previousLiquidList)
@@ -371,8 +498,15 @@ namespace NAADF.World.Data
                 grid.liquidIndex[i] = liquidList.Count;
             }
 
+            lastLiquidCells = liquidList.Count;
+        }
+
+        // The pressure solve itself, for the cells ClassifyLiquidCells marked
+        public void SolveProjection(float dt)
+        {
+            ZeroSolidFaces();
+
             int n = liquidList.Count;
-            lastLiquidCells = n;
             lastPressureIterations = 0;
             lastPressureResidual = 0f;
             if (n == 0)
@@ -474,6 +608,7 @@ namespace NAADF.World.Data
             }
         }
 
+        // Whether a cell is liquid or a source in this tick's pressure solve
         private bool IsFluidCell(int index) => index >= 0 && (grid.flags[index] & (FlagLiquid | FlagSource)) != 0;
 
         // A face the pressure solve has made consistent: not against solid, and bordering a liquid or source cell
@@ -488,7 +623,7 @@ namespace NAADF.World.Data
 
         // Below-threshold cells resting directly on liquid or solid take the velocity of the liquid around them on their free faces
         // (zero when resting on solid alone), so gravity can't build up on them; unsupported cells keep their own ballistic velocity
-        private void ExtrapolateIntoSupportedAir()
+        public void ExtrapolateIntoSupportedAir()
         {
             faceUpdates.Clear();
             int end = grid.SlotCount * SparseFluidGrid.BrickCells;
@@ -618,7 +753,7 @@ namespace NAADF.World.Data
 
         // Donor-cell face fluxes using the face velocity directly; whatever leaves one side of a face enters the other
         // Bounded: each donor's total outflow is scaled to what it holds, then each receiver's total inflow is scaled to its free space
-        private void AdvectFill(float dt)
+        public void AdvectFill(float dt)
         {
             foreach (int index in gainedList)
                 grid.flags[index] &= unchecked((byte)~FlagGained);
@@ -742,7 +877,7 @@ namespace NAADF.World.Data
         }
 
         // Removes cells inside solid or a drain, cells holding (almost) nothing, and dim cells that have stopped gaining fill for too long
-        private void PruneStaleCells()
+        public void PruneStaleCells()
         {
             lastPrunedBySolid = 0;
             lastPrunedByEmpty = 0;
@@ -799,7 +934,8 @@ namespace NAADF.World.Data
             }
         }
 
-        private void ApplyDamping(float dt)
+        // Scales every face velocity so that velocityDampingPerSecond of it remains after one second
+        public void ApplyDamping(float dt)
         {
             if (velocityDampingPerSecond >= 1f)
                 return;
@@ -812,7 +948,7 @@ namespace NAADF.World.Data
         }
 
         // No face may carry more than cflMaxFraction of a cell per tick
-        private void ClampVelocity(float dt)
+        public void ClampVelocity(float dt)
         {
             float maxSpeed = cflMaxFraction / dt;
             int end = grid.SlotCount * SparseFluidGrid.BrickCells;

@@ -204,6 +204,14 @@ namespace NAADF
                     App.worldHandler.worldData.sparseFluidHandler.RemoveAllEmitters();
 
                 ImGui.Separator();
+                ImGui.Checkbox("GPU simulation", ref App.worldHandler.worldData.sparseFluidHandler.gpuEnabled);
+                ImGui.SameLine();
+                ImGui.Checkbox("GPU self-check", ref App.worldHandler.worldData.sparseFluidHandler.gpuSelfCheck);
+                ImGui.SameLine();
+                ImGui.Checkbox("GPU kernel timing", ref App.worldHandler.worldData.sparseFluidHandler.gpuMeasureKernels);
+                ImGuiCommon.HelperIcon("Run the solver as compute shaders. With the self-check on, the CPU version of every stage runs as well and its result is the one used; the console then reports the differences between the two and the time each took, every 125 ticks. Kernel timing adds the time the kernels of each stage take to those lines, at the cost of a slower tick.", 500);
+
+                ImGui.Separator();
                 ImGui.SliderInt("Basin fill depth", ref basinFillDepth, 1, NAADF.World.WorldHandler.basinWallHeight);
                 ImGui.SameLine();
                 if (ImGui.Button("Fill basin"))

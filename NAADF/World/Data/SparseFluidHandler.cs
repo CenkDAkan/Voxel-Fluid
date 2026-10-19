@@ -5,6 +5,7 @@ using NAADF.Gui;
 using NAADF.World.Render;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace NAADF.World.Data
 {
@@ -21,8 +22,17 @@ namespace NAADF.World.Data
 
         private uint fluidTypeRenderIndex;
 
-        // Cells this handler has drawn as fluid; the dirty-diff baseline for ApplyToWorld, and excluded from IsSolid
-        private HashSet<long> wasFluidVoxel = new HashSet<long>();
+        // Cells this handler has drawn as fluid, one bit per cell, held per brick of the solver's size and keyed by brick position
+        // The baseline ApplyToWorld compares against, and excluded from IsSolid
+        private class DrawnBrick
+        {
+            public uint[] bits = new uint[SparseFluidGrid.BrickCells / 32];
+            public bool seen;
+        }
+
+        private Dictionary<long, DrawnBrick> drawnBricks = new Dictionary<long, DrawnBrick>();
+        private uint[] visibleMask = new uint[0];
+        private readonly List<long> drawnBricksToRemove = new List<long>();
 
         private static readonly Point3[] NeighborOffsets =
         {
@@ -33,13 +43,21 @@ namespace NAADF.World.Data
 
         private float physicsIntervalMs = 16f;
         private float physicsAccumulatorMs = 0f;
-        private const int maxPhysicsStepsPerFrame = 4;
+        private const float physicsBudgetMsPerFrame = 12f; // once a frame's ticks have taken this long, the rest of the backlog is dropped
 
         // Drive LogTick's finer-grained window after each seed or emitter placement
         private int ticksSinceSeed = 0;
         private bool loggedFirstContact = false;
         private int? lastKnownFloorY = null;
-        private float volumeAtLastLog = 0f;
+        private double volumeAtLastLog = 0.0;
+
+        // Above this many cells the log prints every 62 ticks from the start, instead of every 4 for the first 125
+        private const int fineLogMaxCells = 20000;
+
+        // Time spent outside the solver, and ticks counted, since the last timing line
+        private const int timingLogEveryTicks = 125;
+        private int ticksSinceTimingLog = 0, framesSinceTimingLog = 0;
+        private double logMs = 0.0, applyToWorldMs = 0.0;
 
         private enum EmitterKind { Tap, Sprinkler }
 
@@ -58,11 +76,18 @@ namespace NAADF.World.Data
         private uint emitterTypeRenderIndex;
         private const int nozzleRadius = 1; // 3x3 nozzle cross-section
 
+        // Run the solver through its compute shader stages; with the self-check on, the CPU version of each runs too and stays authoritative
+        public bool gpuEnabled = false;
+        public bool gpuSelfCheck = false;
+        public bool gpuMeasureKernels = false; // logs the time the kernels of each stage take by waiting for the GPU around them
+        private SparseFluidGpu gpu;
+
         public float emitterSpeed = 25f;
         public float sprinklerArcDegrees = 120f;
         public float sprinklerAngularSpeedDegPerSec = 90f;
         public float sprinklerTiltDegrees = 35f;
 
+        // Creates the solver with this handler's solid and drain lookups, and registers the fluid and emitter voxel types
         public SparseFluidHandler(WorldData worldData)
         {
             this.worldData = worldData;
@@ -91,33 +116,91 @@ namespace NAADF.World.Data
             emitterTypeRenderIndex = App.worldHandler.voxelTypeHandler.ApplyVoxelType(emitterType).renderIndex;
         }
 
+        // Tells the solver about every chunk edited since the last GPU upload (editing tools, scene buttons), so it re-queries solids there
+        private void InvalidateEditedTerrain()
+        {
+            ChangeHandler changeHandler = worldData.changeHandler;
+            for (int i = 0; i < changeHandler.changedChunkCount; i++)
+            {
+                uint packed = changeHandler.changedChunks[i].data1;
+                Point3 min = new Point3((int)(packed & 0x7FF), (int)((packed >> 11) & 0x3FF), (int)(packed >> 21)) * 16;
+                solver.InvalidateSolid(min, min + new Point3(15));
+            }
+        }
+
+        // Per frame: reacts to terrain edits and input, runs the due physics ticks on the CPU or GPU within the frame budget, then draws the result
         public void Update(float gameTime)
         {
+            InvalidateEditedTerrain();
             HandlePlaceInput();
             HandleEmitterInput();
 
             if (solver.Count == 0 && emitters.Count == 0)
                 return;
 
+            if (gpuEnabled)
+            {
+                gpu ??= new SparseFluidGpu(solver, App.graphicsDevice, App.contentManager.Load<Microsoft.Xna.Framework.Graphics.Effect>("shaders/fluid/sparseFluidSim"));
+                gpu.selfCheck = gpuSelfCheck;
+                gpu.measureKernels = gpuMeasureKernels;
+            }
+            else
+                gpu?.Release();
+
+            // At least one tick per frame when one is due, then more until the frame's time budget is used up
             physicsAccumulatorMs += gameTime;
             bool stepped = false;
-            int stepsThisFrame = 0;
-            while (physicsAccumulatorMs >= physicsIntervalMs && stepsThisFrame < maxPhysicsStepsPerFrame)
+            bool overBudget = false;
+            long budgetStart = Stopwatch.GetTimestamp();
+            while (physicsAccumulatorMs >= physicsIntervalMs && !overBudget)
             {
                 physicsAccumulatorMs -= physicsIntervalMs;
                 float dt = physicsIntervalMs / 1000f;
-                solver.Step(dt, BuildSources(dt));
+                List<SparseFluidSolver.Source> sources = BuildSources(dt);
+                if (gpuEnabled)
+                    gpu.Step(dt, sources);
+                else
+                    solver.Step(dt, sources);
                 ticksSinceSeed++;
+                long logStart = Stopwatch.GetTimestamp();
                 LogTick();
+                logMs += (Stopwatch.GetTimestamp() - logStart) * 1000.0 / Stopwatch.Frequency;
+                ticksSinceTimingLog++;
                 stepped = true;
-                stepsThisFrame++;
+                overBudget = (Stopwatch.GetTimestamp() - budgetStart) * 1000.0 / Stopwatch.Frequency >= physicsBudgetMsPerFrame;
                 if (physicsIntervalMs <= 0f) break;
             }
-            if (stepsThisFrame >= maxPhysicsStepsPerFrame)
+            if (overBudget)
                 physicsAccumulatorMs = 0f; // drop the backlog rather than compound it into the next frame
 
             if (stepped)
+            {
+                long applyStart = Stopwatch.GetTimestamp();
                 ApplyToWorld();
+                applyToWorldMs += (Stopwatch.GetTimestamp() - applyStart) * 1000.0 / Stopwatch.Frequency;
+                framesSinceTimingLog++;
+            }
+
+            if (ticksSinceTimingLog >= timingLogEveryTicks)
+                LogTiming();
+        }
+
+        // Average time per tick of every solver stage, plus this handler's own logging (per tick) and drawing (per frame)
+        private void LogTiming()
+        {
+            double solverTotal = 0.0;
+            string stages = "";
+            for (int i = 0; i < solver.stageMs.Length; i++)
+            {
+                solverTotal += solver.stageMs[i];
+                stages += $"{SparseFluidSolver.StageNames[i]} {solver.stageMs[i] / ticksSinceTimingLog:F2}, ";
+                solver.stageMs[i] = 0.0;
+            }
+            Console.WriteLine($"SparseFluidHandler: timing over {ticksSinceTimingLog} ticks in {framesSinceTimingLog} frames, bricks = {solver.grid.BrickCount}, ms/tick: solver {solverTotal / ticksSinceTimingLog:F2} ({stages.TrimEnd(',', ' ')}), logging {logMs / ticksSinceTimingLog:F2}; ApplyToWorld {applyToWorldMs / Math.Max(framesSinceTimingLog, 1):F2} ms/frame");
+
+            ticksSinceTimingLog = 0;
+            framesSinceTimingLog = 0;
+            logMs = applyToWorldMs = 0.0;
         }
 
         // P drops a seed sphere aimed from the camera
@@ -148,6 +231,7 @@ namespace NAADF.World.Data
         // Fills a box (bounds inclusive) with fluid at rest, for seeding large volumes at once
         public void SeedBox(Point3 min, Point3 max)
         {
+            gpu?.Release();
             solver.SeedBox(min, max);
             ticksSinceSeed = 0;
             loggedFirstContact = false;
@@ -155,8 +239,10 @@ namespace NAADF.World.Data
             Console.WriteLine($"SparseFluidHandler: filled box ({min.X}, {min.Y}, {min.Z}) to ({max.X}, {max.Y}, {max.Z}), tracked cells = {solver.Count}, volume = {volumeAtLastLog:F2}.");
         }
 
+        // Fills a sphere with fluid at rest and restarts the log window and volume ledger
         private void SeedSphere(Point3 center, int radius)
         {
+            gpu?.Release();
             solver.SeedSphere(center, radius);
             ticksSinceSeed = 0;
             loggedFirstContact = false;
@@ -173,6 +259,7 @@ namespace NAADF.World.Data
                 PlaceEmitter(EmitterKind.Sprinkler);
         }
 
+        // Places a tap or sprinkler at the aim point: its marker voxel replaces any fluid there and the stream starts next tick
         private void PlaceEmitter(EmitterKind kind)
         {
             Vector3 camPos = WorldRender.camera.GetPos().toVector3();
@@ -192,9 +279,11 @@ namespace NAADF.World.Data
                 ? DominantAxisStep(forwardXZ)
                 : new Point3(0, nozzleRadius + 1, 0);
 
+            gpu?.Release();
             solver.RemoveCell(position);
-            wasFluidVoxel.Remove(SparseFluidGrid.Key(position));
+            SetDrawn(position, false);
             PlaceMarkerVoxel(position);
+            solver.InvalidateSolid(position, position);
 
             emitters.Add(new Emitter { kind = kind, position = position, nozzleOffset = nozzleOffset, forwardXZ = forwardXZ });
             ticksSinceSeed = 0;
@@ -207,11 +296,15 @@ namespace NAADF.World.Data
         public void RemoveAllEmitters()
         {
             foreach (Emitter emitter in emitters)
+            {
                 WriteCell(emitter.position, false);
+                solver.InvalidateSolid(emitter.position, emitter.position);
+            }
             emitters.Clear();
             CommitEdits();
         }
 
+        // Writes an emitter's marker voxel into the world
         private void PlaceMarkerVoxel(Point3 worldVoxel)
         {
             Point3 chunkPos = worldVoxel / 16;
@@ -277,12 +370,13 @@ namespace NAADF.World.Data
         // Erases every cell and marker this handler has drawn and drops all simulation state
         public void ClearAll()
         {
-            if (wasFluidVoxel.Count == 0 && solver.Count == 0 && emitters.Count == 0)
+            if (drawnBricks.Count == 0 && solver.Count == 0 && emitters.Count == 0)
                 return;
+            gpu?.Release();
 
-            foreach (long key in wasFluidVoxel)
-                WriteCell(SparseFluidGrid.Unpack(key), false);
-            wasFluidVoxel.Clear();
+            foreach (KeyValuePair<long, DrawnBrick> drawn in drawnBricks)
+                EraseDrawnBrick(drawn.Key, drawn.Value);
+            drawnBricks.Clear();
 
             foreach (Emitter emitter in emitters)
                 WriteCell(emitter.position, false);
@@ -294,15 +388,17 @@ namespace NAADF.World.Data
             physicsAccumulatorMs = 0f;
         }
 
+        // Solid lookup for the solver: outside the world is solid, voxels this handler drew as fluid are not
         private bool IsSolid(Point3 worldVoxel)
         {
             if (!IsInsideWorld(worldVoxel))
                 return true;
-            if (wasFluidVoxel.Contains(SparseFluidGrid.Key(worldVoxel)))
+            if (IsDrawn(worldVoxel))
                 return false;
             return worldData.IsVoxelSolid(worldVoxel);
         }
 
+        // Whether a voxel position lies inside the world
         private bool IsInsideWorld(Point3 p)
         {
             return p.X >= 0 && p.Y >= 0 && p.Z >= 0
@@ -324,33 +420,160 @@ namespace NAADF.World.Data
             worldData.editingHandler.processChunks(true);
         }
 
-        // Draws cells above the visibility threshold and erases cells that dropped below it or left tracking
+        // Key of the drawn-cell brick holding a cell
+        private static long DrawnBrickKey(Point3 cell)
+        {
+            return SparseFluidGrid.Key(new Point3(cell.X >> SparseFluidGrid.BrickShift, cell.Y >> SparseFluidGrid.BrickShift, cell.Z >> SparseFluidGrid.BrickShift));
+        }
+
+        // Bit of a cell within its drawn-cell brick, in the same order as the grid's local cell index
+        private static int DrawnBit(Point3 cell)
+        {
+            return (cell.X & SparseFluidGrid.BrickMask) | ((cell.Y & SparseFluidGrid.BrickMask) << SparseFluidGrid.BrickShift) | ((cell.Z & SparseFluidGrid.BrickMask) << (SparseFluidGrid.BrickShift * 2));
+        }
+
+        // Whether this handler currently has the cell drawn as fluid
+        private bool IsDrawn(Point3 cell)
+        {
+            if (!drawnBricks.TryGetValue(DrawnBrickKey(cell), out DrawnBrick drawn))
+                return false;
+            int bit = DrawnBit(cell);
+            return (drawn.bits[bit >> 5] & (1u << (bit & 31))) != 0;
+        }
+
+        // Records whether the cell is drawn as fluid, creating its brick entry only when setting a bit
+        private void SetDrawn(Point3 cell, bool value)
+        {
+            long key = DrawnBrickKey(cell);
+            if (!drawnBricks.TryGetValue(key, out DrawnBrick drawn))
+            {
+                if (!value)
+                    return;
+                drawn = new DrawnBrick { seen = true };
+                drawnBricks[key] = drawn;
+            }
+
+            int bit = DrawnBit(cell);
+            if (value)
+                drawn.bits[bit >> 5] |= 1u << (bit & 31);
+            else
+                drawn.bits[bit >> 5] &= ~(1u << (bit & 31));
+        }
+
+        // Erases every cell drawn in one brick
+        private void EraseDrawnBrick(long key, DrawnBrick drawn)
+        {
+            Point3 origin = SparseFluidGrid.Unpack(key) * SparseFluidGrid.BrickSize;
+            for (int element = 0; element < drawn.bits.Length; element++)
+            {
+                uint bits = drawn.bits[element];
+                while (bits != 0)
+                {
+                    int local = element * 32 + System.Numerics.BitOperations.TrailingZeroCount(bits);
+                    bits &= bits - 1;
+                    WriteCell(origin + LocalCell(local), false);
+                }
+                drawn.bits[element] = 0;
+            }
+        }
+
+        // Offset of a cell from its brick origin, from its local index
+        private static Point3 LocalCell(int local)
+        {
+            return new Point3(local & SparseFluidGrid.BrickMask, (local >> SparseFluidGrid.BrickShift) & SparseFluidGrid.BrickMask, local >> (SparseFluidGrid.BrickShift * 2));
+        }
+
+        // One bit per cell of every brick slot: tracked and above the visibility threshold
+        private void BuildVisibleMask()
+        {
+            SparseFluidGrid grid = solver.grid;
+            int elements = grid.SlotCount * (SparseFluidGrid.BrickCells / 32);
+            if (visibleMask.Length < elements)
+                visibleMask = new uint[Math.Max(elements, visibleMask.Length * 2)];
+            if (gpuEnabled && gpu != null && gpu.ReadVisibleMask(visibleMask))
+                return;
+
+            for (int element = 0; element < elements; element++)
+            {
+                uint bits = 0;
+                int start = element * 32;
+                for (int k = 0; k < 32; k++)
+                    if (grid.tracked[start + k] != 0 && grid.fill[start + k] > SparseFluidSolver.visibilityThreshold)
+                        bits |= 1u << k;
+                visibleMask[element] = bits;
+            }
+        }
+
+        // Draws cells above the visibility threshold and erases cells that dropped below it or left tracking,
+        // going only through the cells whose visibility differs from what is drawn
         private void ApplyToWorld()
         {
             SparseFluidGrid grid = solver.grid;
-            HashSet<long> nowFluid = new HashSet<long>();
-            foreach (long key in grid.SnapshotKeys())
-                if (grid.GetFill(key) > SparseFluidSolver.visibilityThreshold)
-                    nowFluid.Add(key);
+            BuildVisibleMask();
+            bool wrote = false;
+            int elementsPerBrick = SparseFluidGrid.BrickCells / 32;
 
-            foreach (long key in nowFluid)
+            foreach (DrawnBrick drawn in drawnBricks.Values)
+                drawn.seen = false;
+
+            for (int slot = 0; slot < grid.SlotCount; slot++)
             {
-                if (!wasFluidVoxel.Contains(key) && WriteCell(SparseFluidGrid.Unpack(key), true))
-                    wasFluidVoxel.Add(key);
+                if (!grid.IsSlotAllocated(slot))
+                    continue;
+                Point3 origin = grid.SlotOrigin(slot);
+                if (origin.X < 0 || origin.Y < 0 || origin.Z < 0)
+                    continue;
+
+                long key = DrawnBrickKey(origin);
+                bool hasDrawn = drawnBricks.TryGetValue(key, out DrawnBrick drawn);
+                if (hasDrawn)
+                    drawn.seen = true;
+
+                for (int element = 0; element < elementsPerBrick; element++)
+                {
+                    uint now = visibleMask[slot * elementsPerBrick + element];
+                    uint changed = now ^ (hasDrawn ? drawn.bits[element] : 0u);
+                    while (changed != 0)
+                    {
+                        int bit = System.Numerics.BitOperations.TrailingZeroCount(changed);
+                        changed &= changed - 1;
+                        bool visible = (now & (1u << bit)) != 0;
+                        if (!WriteCell(origin + LocalCell(element * 32 + bit), visible))
+                            continue;
+
+                        if (!hasDrawn)
+                        {
+                            drawn = new DrawnBrick { seen = true };
+                            drawnBricks[key] = drawn;
+                            hasDrawn = true;
+                        }
+                        if (visible)
+                            drawn.bits[element] |= 1u << bit;
+                        else
+                            drawn.bits[element] &= ~(1u << bit);
+                        wrote = true;
+                    }
+                }
             }
 
-            List<long> toErase = new List<long>();
-            foreach (long key in wasFluidVoxel)
-                if (!nowFluid.Contains(key))
-                    toErase.Add(key);
+            // Bricks the solver has let go of
+            drawnBricksToRemove.Clear();
+            foreach (KeyValuePair<long, DrawnBrick> drawn in drawnBricks)
+            {
+                if (drawn.Value.seen)
+                    continue;
+                EraseDrawnBrick(drawn.Key, drawn.Value);
+                drawnBricksToRemove.Add(drawn.Key);
+                wrote = true;
+            }
+            foreach (long key in drawnBricksToRemove)
+                drawnBricks.Remove(key);
 
-            foreach (long key in toErase)
-                if (WriteCell(SparseFluidGrid.Unpack(key), false))
-                    wasFluidVoxel.Remove(key);
-
-            CommitEdits();
+            if (wrote)
+                CommitEdits();
         }
 
+        // Stages a fluid voxel or air at a world position; returns false when the voxel is outside the world, or when drawing it would overwrite solid terrain
         private bool WriteCell(Point3 worldVoxel, bool visible)
         {
             if (!IsInsideWorld(worldVoxel))
@@ -367,18 +590,27 @@ namespace NAADF.World.Data
             return true;
         }
 
+        // Takes the current total volume as the ledger's baseline and zeroes the solver's volume counters
         private void ResetVolumeTracking()
         {
             volumeAtLastLog = solver.TotalVolume();
             solver.ClearVolumeAccumulators();
         }
 
+        // Walks every cell, so it only does that on the ticks it prints (and until first solid contact has been reported)
         private void LogTick()
         {
             SparseFluidGrid grid = solver.grid;
+            bool fineGrained = ticksSinceSeed <= 125 && grid.Count <= fineLogMaxCells;
+            int logEveryTicks = fineGrained ? 4 : 62;
+            bool printing = ticksSinceSeed % logEveryTicks == 0;
+            if (!printing && loggedFirstContact)
+                return;
+            gpu?.Download(true);
+
             int visibleCellCount = 0;
             float totalSpeed = 0f;
-            float totalVolume = 0f;
+            double totalVolume = 0.0;
             bool contactThisTick = false;
             int minY = int.MaxValue, maxY = int.MinValue;
 
@@ -415,9 +647,7 @@ namespace NAADF.World.Data
                 Console.WriteLine($"SparseFluidHandler: first solid contact at tick {ticksSinceSeed} ({ticksSinceSeed * physicsIntervalMs / 1000f:F2}s), visible cells = {visibleCellCount}, tracked cells = {grid.Count}.");
             }
 
-            bool fineGrained = ticksSinceSeed <= 125;
-            int logEveryTicks = fineGrained ? 4 : 62;
-            if (ticksSinceSeed % logEveryTicks != 0)
+            if (!printing)
                 return;
 
             string bandYInfo = grid.Count > 0 ? $", Y range = [{minY}, {maxY}]" : "";
@@ -425,7 +655,7 @@ namespace NAADF.World.Data
             Console.WriteLine($"SparseFluidHandler: tick {ticksSinceSeed} ({ticksSinceSeed * physicsIntervalMs / 1000f:F2}s), visible cells = {visibleCellCount}, tracked cells = {grid.Count}, liquid cells = {solver.lastLiquidCells}, total speed = {totalSpeed:F3}, pressure iterations = {solver.lastPressureIterations} (residual {solver.lastPressureResidual:E1}), pruned this tick (solid/empty/drained) = {solver.lastPrunedBySolid}/{solver.lastPrunedByEmpty}/{solver.lastDrained}, emitters = {emitters.Count}{bandYInfo}{floorInfo}");
 
             float expectedChange = solver.volumeInjected + solver.volumeClampCreated - solver.volumeClampedAway - solver.volumePrunedSolid - solver.volumePrunedEmpty - solver.volumePrunedStagnant - solver.volumeDrained;
-            float unaccounted = (totalVolume - volumeAtLastLog) - expectedChange;
+            double unaccounted = (totalVolume - volumeAtLastLog) - expectedChange;
             Console.WriteLine($"    volume = {totalVolume:F2}, since last log: injected +{solver.volumeInjected:F2}, clamp lost -{solver.volumeClampedAway:F3}, clamp created +{solver.volumeClampCreated:F3}, pruned solid -{solver.volumePrunedSolid:F3} / empty -{solver.volumePrunedEmpty:F3} / stagnant -{solver.volumePrunedStagnant:F3}, drained -{solver.volumeDrained:F3}, unaccounted {unaccounted:F3}");
 
             volumeAtLastLog = totalVolume;
