@@ -65,6 +65,11 @@ namespace NAADF.World.Data
         private int cellCapacity = 0;
         private int slots, cells; // of the stage being run
 
+        // Slots the buffers that keep their contents between ticks may hold data for, from there on they are zero
+        private int gpuSlots = 0;
+        private static readonly float[] zeroFloats = new float[65536];
+        private static readonly uint[] zeroUints = new uint[65536];
+
         // Face velocities, pressure, fill fractions, and one state word per cell (SparseFluidGrid.PackState)
         private readonly Mirror[] face = { new Mirror(), new Mirror(), new Mirror() };
         private readonly Mirror pressure = new Mirror(), fill = new Mirror(), state = new Mirror();
@@ -105,6 +110,9 @@ namespace NAADF.World.Data
         private static readonly string[] FaceRwNames = { "faceRwX", "faceRwY", "faceRwZ" };
 
         public bool selfCheck = false;
+
+        // Prints the per-stage lines, with selfCheck or measureKernels on they are printed regardless
+        public bool logging = false;
 
         // Waits for the GPU before and after each stage's kernels, so the time they take can be logged on its own; slows the tick down
         public bool measureKernels = false;
@@ -172,6 +180,7 @@ namespace NAADF.World.Data
             {
                 face[axis].buffer = CreateBuffer(typeof(float), gridCells);
                 faceScratchBuffer[axis] = CreateBuffer(typeof(float), gridCells);
+                ZeroCells(faceScratchBuffer[axis], zeroFloats, 0, gridCells);
                 faceReadback[axis] = new float[gridCells];
             }
             pressure.buffer = CreateBuffer(typeof(float), gridCells);
@@ -182,6 +191,7 @@ namespace NAADF.World.Data
                 mirror.gpuCurrent = false;
                 mirror.neverUploaded = true;
             }
+            gpuSlots = 0;
 
             diagBuffer = CreateBuffer(typeof(float), gridCells);
             rBuffer = CreateBuffer(typeof(float), gridCells);
@@ -207,6 +217,29 @@ namespace NAADF.World.Data
             pressureReadback = new float[gridCells];
             fillReadback = new float[gridCells];
             summaryReadback = new uint[slotCapacity];
+        }
+
+        // Writes zeros into count cells of a buffer from cell start on
+        private static void ZeroCells<T>(StructuredBuffer buffer, T[] zeros, int start, int count) where T : struct
+        {
+            for (int done = 0; done < count; done += zeros.Length)
+                buffer.SetData((start + done) * 4, zeros, 0, Math.Min(zeros.Length, count - done), 0);
+        }
+
+        // Zeroes the slots from firstSlot up to gpuSlots in every buffer that keeps its contents between ticks,
+        // so that slots the grid hands out again after it was cleared don't start with the previous cells
+        private void ZeroSlotsFrom(int firstSlot)
+        {
+            int start = firstSlot * SparseFluidGrid.BrickCells;
+            int count = gpuSlots * SparseFluidGrid.BrickCells - start;
+            for (int axis = 0; axis < 3; axis++)
+            {
+                ZeroCells(face[axis].buffer, zeroFloats, start, count);
+                ZeroCells(faceScratchBuffer[axis], zeroFloats, start, count);
+            }
+            ZeroCells(pressure.buffer, zeroFloats, start, count);
+            ZeroCells(fill.buffer, zeroFloats, start, count);
+            ZeroCells(state.buffer, zeroUints, start, count);
         }
 
         // The first upload of an array covers the whole buffer, so slots that come into use later start out as they are on the CPU
@@ -339,15 +372,15 @@ namespace NAADF.World.Data
                 ToCpu(Arrays.Faces | Arrays.Pressure);
         }
 
-        // Fills in one bit per cell (32 cells per element, in cell index order) saying whether the cell is tracked and above the visibility threshold
+        // Fills in one bit per cell (32 cells per element, in cell index order) saying whether the cell is tracked and its fill above threshold
         // Returns false without doing so when the grid holds the current cells, which the caller can then read itself
-        public bool ReadVisibleMask(uint[] target)
+        public bool ReadVisibleMask(uint[] target, float threshold)
         {
             if (cellCapacity == 0 || state.cpuCurrent || fill.cpuCurrent)
                 return false;
 
             BindBuffers();
-            effect.Parameters["visibilityThreshold"].SetValue(SparseFluidSolver.visibilityThreshold);
+            effect.Parameters["visibilityThreshold"].SetValue(threshold);
             int elements = slots * (SparseFluidGrid.BrickCells / 32);
             Dispatch("BuildVisibleMask", (elements + 63) / 64);
             visibleMaskBuffer.GetData(target, 0, elements);
@@ -414,6 +447,7 @@ namespace NAADF.World.Data
             effect.Parameters["pressureTolerance"].SetValue(SparseFluidSolver.pressureTolerance);
             effect.Parameters["minFillEpsilon"].SetValue(SparseFluidSolver.minFillEpsilon);
             effect.Parameters["stagnantLimit"].SetValue(solver.stagnantTicksBeforeDestroy);
+            effect.Parameters["keepSurfaceFilm"].SetValue(solver.keepSurfaceFilm ? 1 : 0);
         }
 
         // Runs one kernel of the effect with the given number of compute groups
@@ -541,6 +575,11 @@ namespace NAADF.World.Data
             slots = grid.SlotCount;
             cells = slots * SparseFluidGrid.BrickCells;
             layoutCurrent = solidCurrent = false;
+
+            // Fewer slots than before only happens when the grid was cleared
+            if (slots < gpuSlots)
+                ZeroSlotsFrom(slots);
+            gpuSlots = slots;
         }
 
         // Runs one stage: its kernels, and with the self-check on its CPU version afterwards, which is then the result kept
@@ -790,6 +829,21 @@ namespace NAADF.World.Data
             if (++statistics.ticks < logEveryTicks)
                 return;
 
+            if (logging || selfCheck || measureKernels)
+                PrintStatistics(statistics);
+
+            statistics.ticks = 0;
+            statistics.gpuMs = statistics.cpuMs = statistics.kernelMs = 0.0;
+            statistics.maxDifference = 0f;
+            statistics.compared = statistics.overTolerance = 0;
+            statistics.gpuIterations = statistics.cpuIterations = 0;
+            statistics.unconvergedTicks = statistics.extraBatches = 0;
+            statistics.stateMismatches = 0;
+        }
+
+        // Prints one stage's timing and self-check figures
+        private void PrintStatistics(StageStatistics statistics)
+        {
             string line = $"SparseFluidGpu: {statistics.name} over {statistics.ticks} ticks, {slots} brick slots, GPU {statistics.gpuMs / statistics.ticks:F2} ms/tick";
             if (measureKernels)
                 line += $" of which kernels {statistics.kernelMs / statistics.ticks:F2}";
@@ -805,14 +859,6 @@ namespace NAADF.World.Data
                     line += $", {statistics.stateMismatches} cells with a different state";
             }
             Console.WriteLine(line);
-
-            statistics.ticks = 0;
-            statistics.gpuMs = statistics.cpuMs = statistics.kernelMs = 0.0;
-            statistics.maxDifference = 0f;
-            statistics.compared = statistics.overTolerance = 0;
-            statistics.gpuIterations = statistics.cpuIterations = 0;
-            statistics.unconvergedTicks = statistics.extraBatches = 0;
-            statistics.stateMismatches = 0;
         }
 
         // Frees every buffer whose size follows the grid's capacity

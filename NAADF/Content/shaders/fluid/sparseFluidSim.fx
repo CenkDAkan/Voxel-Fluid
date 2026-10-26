@@ -60,6 +60,7 @@ float velocityScale; // damping factor per tick
 float maxSpeed;
 float visibilityThreshold;
 int stagnantLimit; // ticks a dim cell may go without gaining fill
+int keepSurfaceFilm; // SparseFluidSolver.keepSurfaceFilm, 0 or 1
 int sourceCount;
 int previousSourceCount;
 int ledgerFirst;   // range of ledger slots sumBrickLedger adds up
@@ -985,7 +986,7 @@ void fillApply(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
             amount = ScaleExact(amount, max(space, 0.0f), incoming);
 
         // Negligible amounts don't start new cells
-        if (amount < minFillEpsilon && fill[receiver] <= minFillEpsilon)
+        if (amount < minFillEpsilon && fill[receiver] <= minFillEpsilon && !(keepSurfaceFilm != 0 && IsLiquidCell(donor)))
             continue;
 
         touched = true;
@@ -1046,6 +1047,13 @@ void finishFill(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 // ---------------------------------------------------------------------------------------------------------
 // Pruning: removes cells in a drain or in solid, cells holding (almost) nothing, and dim cells that went too long without gaining fill
 
+// Whether the cell below is a liquid cell that this pass keeps (neither solid nor a drain), whatever order the cells run in
+bool RestsOnLiquid(int index)
+{
+    int below = NeighborCell(index, 1, -1);
+    return below >= 0 && (cellStateRw[below] & STATE_LIQUID) != 0 && (SolidBits(below) & (SOLID_BLOCKED | SOLID_DRAIN)) == 0;
+}
+
 // Removes drained, solid, empty and stagnant cells, and leaves the brick's removed volumes and counts in brickLedger
 [numthreads(8, 8, 8)]
 void pruneStaleCells(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
@@ -1065,6 +1073,8 @@ void pruneStaleCells(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex
             kind = LEDGER_DRAINED;
         else if ((solidBits & SOLID_BLOCKED) != 0)
             kind = LEDGER_PRUNED_SOLID;
+        else if (keepSurfaceFilm != 0 && ownFill > 0.0f && ownFill <= visibilityThreshold && RestsOnLiquid(index))
+            state &= STATE_LOW_HALF;
         else if (ownFill <= minFillEpsilon)
             kind = LEDGER_PRUNED_EMPTY;
         else if ((state & STATE_GAINED) != 0)

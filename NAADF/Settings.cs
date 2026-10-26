@@ -91,6 +91,8 @@ namespace NAADF
     {
         public FluidSimulationMode mode = FluidSimulationMode.None;
         private int basinFillDepth = 4;
+        private float basinTopFill = 1f;
+        private bool showDebugTools = false;
 
         public void RenderImGui()
         {
@@ -186,9 +188,6 @@ namespace NAADF
                 ImGui.SliderFloat("Velocity damping / sec", ref App.worldHandler.worldData.sparseFluidHandler.solver.velocityDampingPerSecond, 0f, 1f);
                 ImGuiCommon.HelperIcon("Fraction of velocity retained per second (1 = no damping/frictionless, lower = more viscous). Pressure projection alone only stops motion INTO a wall (free-slip), not sliding along one - without this a settled puddle can slosh along the floor forever instead of coming to rest.", 500);
 
-                ImGui.SliderInt("Stagnant ticks before destroy", ref App.worldHandler.worldData.sparseFluidHandler.solver.stagnantTicksBeforeDestroy, 1, 300);
-                ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it's destroyed. Too low and a splash gets whittled away before it can consolidate into a resting puddle; too high and a genuinely thinning film on open ground lingers longer, tracked but invisible, before cleanup.", 500);
-
                 ImGui.Separator();
                 ImGui.Text("P = drop a blob, T = tap, J = sprinkler");
 
@@ -204,23 +203,60 @@ namespace NAADF
                     App.worldHandler.worldData.sparseFluidHandler.RemoveAllEmitters();
 
                 ImGui.Separator();
-                ImGui.Checkbox("GPU simulation", ref App.worldHandler.worldData.sparseFluidHandler.gpuEnabled);
-                ImGui.SameLine();
-                ImGui.Checkbox("GPU self-check", ref App.worldHandler.worldData.sparseFluidHandler.gpuSelfCheck);
-                ImGui.SameLine();
-                ImGui.Checkbox("GPU kernel timing", ref App.worldHandler.worldData.sparseFluidHandler.gpuMeasureKernels);
-                ImGuiCommon.HelperIcon("Run the solver as compute shaders. With the self-check on, the CPU version of every stage runs as well and its result is the one used; the console then reports the differences between the two and the time each took, every 125 ticks. Kernel timing adds the time the kernels of each stage take to those lines, at the cost of a slower tick.", 500);
-
-                ImGui.Separator();
                 ImGui.SliderInt("Basin fill depth", ref basinFillDepth, 1, NAADF.World.WorldHandler.basinWallHeight);
                 ImGui.SameLine();
                 if (ImGui.Button("Fill basin"))
                 {
                     App.worldHandler.GetBasinInterior(out NAADF.Common.Point3 basinMin, out NAADF.Common.Point3 basinMax);
-                    App.worldHandler.worldData.sparseFluidHandler.SeedBox(basinMin, new NAADF.Common.Point3(basinMax.X, basinMin.Y + basinFillDepth - 1, basinMax.Z));
+                    App.worldHandler.worldData.sparseFluidHandler.SeedBox(basinMin, new NAADF.Common.Point3(basinMax.X, basinMin.Y + basinFillDepth - 1, basinMax.Z), showDebugTools ? basinTopFill : 1f);
                 }
                 ImGuiCommon.HelperIcon("Fills the basin wall to wall with resting fluid up to the chosen depth (65,536 cells per layer). Needs \"Build basin floor\" first.", 500);
+
+                ImGui.Separator();
+                if (ImGui.Checkbox("Debugging tools", ref showDebugTools) && !showDebugTools)
+                    ResetDebugTools();
+                ImGuiCommon.HelperIcon("Shows the switches for testing the simulation. Turning this off puts the diagnostic ones back to their defaults: GPU simulation on, self-check, kernel timing and logging off.", 500);
+                if (showDebugTools)
+                    RenderDebugTools();
             }
+        }
+
+        // Testing switches and tuning values of the sparse Eulerian simulation
+        private void RenderDebugTools()
+        {
+            SparseFluidHandler handler = App.worldHandler.worldData.sparseFluidHandler;
+            ImGui.Indent();
+
+            ImGui.Checkbox("Fluid logging", ref handler.loggingEnabled);
+            ImGuiCommon.HelperIcon("Prints the simulation's tick, volume and timing figures and its events to the console. While off, none of that work is done. The GPU self-check and kernel timing print their lines either way.", 500);
+
+            ImGui.Checkbox("GPU simulation", ref handler.gpuEnabled);
+            ImGui.SameLine();
+            ImGui.Checkbox("GPU self-check", ref handler.gpuSelfCheck);
+            ImGui.SameLine();
+            ImGui.Checkbox("GPU kernel timing", ref handler.gpuMeasureKernels);
+            ImGuiCommon.HelperIcon("Run the solver as compute shaders (the default; off runs it on the CPU). With the self-check on, the CPU version of every stage runs as well and its result is the one used; the console then reports the differences between the two and the time each took, every 125 ticks. Kernel timing adds the time the kernels of each stage take to those lines, at the cost of a slower tick.", 500);
+
+            ImGui.SliderFloat("Draw hysteresis", ref handler.drawHysteresis, 0f, 0.1f, "%.2f");
+            ImGuiCommon.HelperIcon("A cell is drawn once its fill rises above 0.5 plus this margin and erased once it falls below 0.5 minus it. 0 draws exactly at 0.5, where a resting layer at half fill flickers.", 500);
+
+            ImGui.SliderFloat("Top layer fill", ref basinTopFill, 0.05f, 1f, "%.2f");
+            ImGuiCommon.HelperIcon("Fill of the top layer \"Fill basin\" seeds; 0.50 reproduces the half-full layer flicker. Without the debugging tools the top layer is filled completely.", 500);
+
+            ImGui.SliderInt("Stagnant ticks before destroy", ref handler.solver.stagnantTicksBeforeDestroy, 1, 300);
+            ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it's destroyed. Too low and a splash gets whittled away before it can consolidate into a resting puddle; too high and a genuinely thinning film on open ground lingers longer, tracked but invisible, before cleanup.", 500);
+
+            ImGui.Unindent();
+        }
+
+        // Diagnostic switches back to their defaults
+        private static void ResetDebugTools()
+        {
+            SparseFluidHandler handler = App.worldHandler.worldData.sparseFluidHandler;
+            handler.loggingEnabled = false;
+            handler.gpuEnabled = true;
+            handler.gpuSelfCheck = false;
+            handler.gpuMeasureKernels = false;
         }
     }
 

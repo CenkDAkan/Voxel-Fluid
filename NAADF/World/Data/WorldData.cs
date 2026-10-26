@@ -561,6 +561,33 @@ namespace NAADF.World.Data
             return (curNode & 0x40000000) != 0; // bit 30 set = uniform solid type (chunk/block-level)
         }
 
+        // Render index of the type of a single world voxel, 0 when it is empty
+        // Same node walk as IsVoxelSolid, with the type decoded the way RayTraversal does
+        public uint GetVoxelType(Point3 worldVoxel)
+        {
+            Point3 voxelPosInChunk = worldVoxel % 16;
+            Point3 chunkPos = worldVoxel / 16;
+            int chunkIndex = chunkPos.X + chunkPos.Y * sizeInChunks.X + chunkPos.Z * sizeInChunks.X * sizeInChunks.Y;
+            uint curNode = dataChunk[chunkIndex];
+
+            if ((curNode >> 31) != 0)
+            {
+                Point3 blockPosInChunk = voxelPosInChunk / 4;
+                int blockIndex = (int)(curNode & 0x3FFFFFFF) + blockPosInChunk.X + blockPosInChunk.Y * 4 + blockPosInChunk.Z * 16;
+                curNode = dataBlock[blockIndex];
+
+                if ((curNode >> 31) != 0)
+                {
+                    Point3 voxelPosInBlock = worldVoxel % 4;
+                    int voxelIndex = (int)(curNode & 0x3FFFFFFF) * 2 + voxelPosInBlock.X + voxelPosInBlock.Y * 4 + voxelPosInBlock.Z * 16;
+                    uint voxel = (dataVoxel[voxelIndex / 2] >> (16 * (voxelIndex & 0x1))) & 0xFFFF;
+                    return (voxel & 0x8000) != 0 ? voxel & 0x7FFF : 0;
+                }
+            }
+
+            return (curNode & 0x40000000) != 0 ? curNode & 0x3FFFFFFF : 0;
+        }
+
         public void setEffect(Effect effect)
         {
             effect.Parameters["boundingBoxMin"].SetValue(new Vector3(+0.1f));

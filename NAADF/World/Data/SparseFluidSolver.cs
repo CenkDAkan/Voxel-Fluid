@@ -82,6 +82,10 @@ namespace NAADF.World.Data
         public int stagnantTicksBeforeDestroy = 150;
         public float compactionRate = 0.05f; // fraction of a liquid cell's missing fill drawn in per tick
 
+        // Liquid cells pass on even negligible amounts, and dim cells resting on liquid are never pruned as empty or stagnant,
+        // so a thin layer of fluid spreading over a surface is kept instead of being clamped or pruned away
+        public bool keepSurfaceFilm = true;
+
         // Diagnostics
         public static readonly string[] StageNames = { "BeginTick", "Gravity", "AdvectVelocity", "Sources", "Project", "Extrapolate", "AdvectFill", "Prune", "Damping", "Clamp" };
         public readonly double[] stageMs = new double[10]; // time spent per stage, accumulated until the owner clears it
@@ -164,8 +168,8 @@ namespace NAADF.World.Data
                     }
         }
 
-        // Fills every non-solid cell of a box (bounds inclusive) completely, at rest
-        public void SeedBox(Point3 min, Point3 max)
+        // Fills every non-solid cell of a box (bounds inclusive) at rest, the top layer (y = max.Y) to topFill and the rest completely
+        public void SeedBox(Point3 min, Point3 max, float topFill = 1f)
         {
             ClearSolidCache();
             for (int z = min.Z; z <= max.Z; z++)
@@ -178,7 +182,7 @@ namespace NAADF.World.Data
                             continue;
 
                         grid.Track(index);
-                        grid.fill[index] = 1f;
+                        grid.fill[index] = y == max.Y ? topFill : 1f;
                         grid.ticksStagnant[index] = 0;
                     }
         }
@@ -289,6 +293,21 @@ namespace NAADF.World.Data
 
         // Whether the cell at a world position is solid, using the cache
         public bool IsSolid(Point3 p) => IsSolid(grid.CellIndex(p), p);
+
+        // Whether the cell below is a liquid cell that this tick's pruning keeps (neither solid nor a drain)
+        private bool RestsOnLiquid(int index)
+        {
+            int below = grid.NeighborIndex(index, 1, -1);
+            if (below < 0 || (grid.flags[below] & FlagLiquid) == 0)
+                return false;
+            byte state = grid.solid[below];
+            if (state == 0)
+            {
+                state = SolidState(grid.CellPosition(below));
+                grid.solid[below] = state;
+            }
+            return (state & (SparseFluidGrid.SolidBlocked | SparseFluidGrid.SolidDrain)) == 0;
+        }
 
         // Whether a cell is solid: cached per cell inside bricks, cached for the tick outside them
         // index is the cell's index, or -1 when no brick covers it
@@ -832,7 +851,7 @@ namespace NAADF.World.Data
             for (int k = 0; k < count; k++)
             {
                 Transfer t = transfers[k];
-                if (t.amount < minFillEpsilon && fill[t.receiver] <= minFillEpsilon)
+                if (t.amount < minFillEpsilon && fill[t.receiver] <= minFillEpsilon && !(keepSurfaceFilm && (flags[t.donor] & FlagLiquid) != 0))
                     continue; // don't create new cells from negligible amounts
 
                 delta[t.donor] -= t.amount;
@@ -904,6 +923,12 @@ namespace NAADF.World.Data
                     grid.Untrack(i);
                     lastPrunedBySolid++;
                     volumePrunedSolid += fill;
+                    continue;
+                }
+
+                if (keepSurfaceFilm && fill > 0f && fill <= visibilityThreshold && RestsOnLiquid(i))
+                {
+                    grid.ticksStagnant[i] = 0;
                     continue;
                 }
 
