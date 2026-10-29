@@ -9,7 +9,7 @@ namespace NAADF.World.Data
     /*
     * Sparse Volume-of-Fluid solver on a staggered (MAC) grid, independent of the engine
     *
-    * Per tick: gravity -> velocity advection -> sources -> pressure projection -> supported-air velocities -> fill transport -> pruning -> damping/clamp
+    * Per tick: gravity -> velocity advection -> sources -> pressure projection -> supported-air velocities -> fill transport -> thin water flow -> pruning -> damping/clamp
     * A cell counts as liquid for the pressure solve when fill >= liquidThreshold; every other non-solid cell is air
     * Solid geometry is queried through the isSolid delegate supplied by the owner
     * Cells for which the optional isDrain delegate returns true are emptied every tick, acting as an open outflow
@@ -43,7 +43,7 @@ namespace NAADF.World.Data
         private const int solidRefreshTicks = 64;
         private int solidRefreshSlot = 0;
 
-        private const byte FlagLiquid = 1, FlagSource = 2, FlagGained = 4, FlagTouched = 8;
+        private const byte FlagLiquid = 1, FlagSource = 2, FlagGained = 4, FlagTouched = 8, FlagThinWater = 16;
 
         // Cell indices carrying a flag, kept so the flags can be cleared without sweeping the grid
         private readonly List<int> sourceList = new List<int>();
@@ -64,6 +64,8 @@ namespace NAADF.World.Data
         public const float minFillEpsilon = 0.001f;
         public const float cflMaxFraction = 0.5f;
         public const float minInterfaceTheta = 0.05f;
+        public const float maxThinWaterRate = 0.2f;
+        public const float thinWaterMinSpreadFill = 0.05f;
 
         private const int maxPressureIterations = 300;
 
@@ -86,9 +88,17 @@ namespace NAADF.World.Data
         // so a thin layer of fluid spreading over a surface is kept instead of being clamped or pruned away
         public bool keepSurfaceFilm = true;
 
+        // Dim cells resting on solid ground, away from liquid, pass this fraction per second of their fill difference to neighbors holding less
+        // (only while above thinWaterMinSpreadFill when the neighbor also rests on solid), and over edges onto unsupported cells; 0 turns it off
+        public float thinWaterFlowPerSecond = 3f;
+
+        // Stagnant dim cells lose evaporationPerSecond of fill per second instead of being removed all at once
+        public bool gradualEvaporation = true;
+        public float evaporationPerSecond = 0.05f;
+
         // Diagnostics
-        public static readonly string[] StageNames = { "BeginTick", "Gravity", "AdvectVelocity", "Sources", "Project", "Extrapolate", "AdvectFill", "Prune", "Damping", "Clamp" };
-        public readonly double[] stageMs = new double[10]; // time spent per stage, accumulated until the owner clears it
+        public static readonly string[] StageNames = { "BeginTick", "Gravity", "AdvectVelocity", "Sources", "Project", "Extrapolate", "AdvectFill", "ThinWater", "Prune", "Damping", "Clamp" };
+        public readonly double[] stageMs = new double[11]; // time spent per stage, accumulated until the owner clears it
         public int lastPrunedBySolid, lastPrunedByEmpty, lastDrained;
         public int lastLiquidCells, lastPressureIterations;
         public float lastPressureResidual;
@@ -146,7 +156,7 @@ namespace NAADF.World.Data
             volumePrunedSolid = volumePrunedEmpty = volumePrunedStagnant = volumeDrained = 0f;
         }
 
-        // Fills a sphere with fill-fraction data at rest; cells inside solid are skipped
+        // Adds a sphere of fill-fraction data to the cells it covers, each capped at full; cells inside solid are skipped
         public void SeedSphere(Point3 center, int radius)
         {
             ClearSolidCache();
@@ -161,14 +171,17 @@ namespace NAADF.World.Data
                             continue;
 
                         Point3 pos = center + new Point3(x, y, z);
-                        if (IsSolid(pos))
+                        int index = grid.EnsureCellIndex(pos);
+                        if (IsSolid(index, pos))
                             continue;
 
-                        grid.SetCell(SparseFluidGrid.Key(pos), new SparseFluidGrid.Cell { fill = fill });
+                        grid.Track(index);
+                        grid.fill[index] = MathF.Min(grid.fill[index] + fill, 1f);
+                        grid.ticksStagnant[index] = 0;
                     }
         }
 
-        // Fills every non-solid cell of a box (bounds inclusive) at rest, the top layer (y = max.Y) to topFill and the rest completely
+        // Adds fluid to every non-solid cell of a box (bounds inclusive), topFill in the top layer (y = max.Y) and full elsewhere, each capped at full
         public void SeedBox(Point3 min, Point3 max, float topFill = 1f)
         {
             ClearSolidCache();
@@ -182,7 +195,7 @@ namespace NAADF.World.Data
                             continue;
 
                         grid.Track(index);
-                        grid.fill[index] = y == max.Y ? topFill : 1f;
+                        grid.fill[index] = MathF.Min(grid.fill[index] + (y == max.Y ? topFill : 1f), 1f);
                         grid.ticksStagnant[index] = 0;
                     }
         }
@@ -207,12 +220,14 @@ namespace NAADF.World.Data
             start = AddStageTime(5, start);
             AdvectFill(dt);
             start = AddStageTime(6, start);
-            PruneStaleCells();
+            FlowThinWater(dt);
             start = AddStageTime(7, start);
-            ApplyDamping(dt);
+            PruneStaleCells(dt);
             start = AddStageTime(8, start);
+            ApplyDamping(dt);
+            start = AddStageTime(9, start);
             ClampVelocity(dt);
-            AddStageTime(9, start);
+            AddStageTime(10, start);
         }
 
         // Adds the time since start to a stage's total and returns the current timestamp, for timing the next stage
@@ -895,9 +910,118 @@ namespace NAADF.World.Data
             }
         }
 
-        // Removes cells inside solid or a drain, cells holding (almost) nothing, and dim cells that have stopped gaining fill for too long
-        public void PruneStaleCells()
+        // Rate per tick at which thin water flows, 0 when thin water flow is off
+        public float ThinWaterRate(float dt) => thinWaterFlowPerSecond <= 0f ? 0f : MathF.Min(thinWaterFlowPerSecond * dt, maxThinWaterRate);
+
+        // Fill a stagnant dim cell loses per tick, 0 when stagnant cells are removed all at once
+        public float EvaporationStep(float dt) => gradualEvaporation ? MathF.Max(evaporationPerSecond * dt, 0f) : 0f;
+
+        // Lets dim cells resting on solid ground flow towards neighbors holding less and over edges, volume only moves between cells
+        public void FlowThinWater(float dt)
         {
+            float rate = ThinWaterRate(dt);
+            if (rate <= 0f)
+                return;
+
+            touchedList.Clear();
+            int end = grid.SlotCount * SparseFluidGrid.BrickCells;
+            for (int i = 0; i < end; i++)
+                if (IsThinWater(i))
+                    grid.flags[i] |= FlagThinWater;
+
+            for (int i = 0; i < end; i++)
+            {
+                if ((grid.flags[i] & FlagThinWater) == 0)
+                    continue;
+                MarkTouched(i);
+                for (int d = 0; d < 4; d++)
+                {
+                    int j = HorizontalNeighbor(i, d);
+                    if (j >= 0 && ThinWaterFlow(i, j, rate) > 0f)
+                        MarkTouched(j);
+                }
+            }
+
+            foreach (int index in touchedList)
+            {
+                float delta = 0f;
+                for (int d = 0; d < 4; d++)
+                {
+                    int j = HorizontalNeighbor(index, d);
+                    if (j >= 0)
+                        delta += ThinWaterFlow(j, index, rate) - ThinWaterFlow(index, j, rate);
+                }
+                grid.delta[index] = delta;
+            }
+
+            foreach (int index in touchedList)
+            {
+                grid.fill[index] += grid.delta[index];
+                grid.delta[index] = 0f;
+                if (grid.fill[index] > 0f)
+                    grid.Track(index);
+                grid.flags[index] &= unchecked((byte)~FlagTouched);
+            }
+            for (int i = 0; i < end; i++)
+                grid.flags[i] &= unchecked((byte)~FlagThinWater);
+        }
+
+        // Adds a cell to touchedList, once
+        private void MarkTouched(int index)
+        {
+            if ((grid.flags[index] & FlagTouched) != 0)
+                return;
+            grid.flags[index] |= FlagTouched;
+            touchedList.Add(index);
+        }
+
+        // Neighbor in the horizontal direction d: 0 = +X, 1 = -X, 2 = +Z, 3 = -Z
+        private int HorizontalNeighbor(int index, int d) => grid.NeighborIndex(index, d < 2 ? 0 : 2, (d & 1) == 0 ? 1 : -1);
+
+        // A dim cell resting on solid with no liquid or source cell beside or above it, so nothing else gives it a velocity
+        private bool IsThinWater(int index)
+        {
+            if (grid.tracked[index] == 0 || (grid.flags[index] & (FlagLiquid | FlagSource)) != 0)
+                return false;
+            float f = grid.fill[index];
+            if (f <= minFillEpsilon || f >= liquidThreshold)
+                return false;
+            if (IsSolid(index, grid.CellPosition(index)) || !SolidBelow(index, false))
+                return false;
+
+            for (int d = 0; d < 4; d++)
+                if (IsFluidCell(HorizontalNeighbor(index, d)))
+                    return false;
+            return !IsFluidCell(grid.NeighborIndex(index, 1, 1));
+        }
+
+        // Fill the thin water cell from passes to its horizontal neighbor to this tick; 0 when from isn't thin water or to can't take it
+        private float ThinWaterFlow(int from, int to, float rate)
+        {
+            if ((grid.flags[from] & FlagThinWater) == 0 || (grid.flags[to] & (FlagLiquid | FlagSource)) != 0)
+                return 0f;
+            float fromFill = grid.fill[from], toFill = grid.fill[to];
+            if (toFill >= fromFill)
+                return 0f;
+            if (IsSolid(to, grid.CellPosition(to)))
+                return 0f;
+            if (fromFill <= thinWaterMinSpreadFill && SolidBelow(to, true))
+                return 0f;
+            return rate * (fromFill - toFill);
+        }
+
+        // Whether the cell below is solid; whenNoBrick is the answer when no brick covers it, as the GPU can't look it up
+        private bool SolidBelow(int index, bool whenNoBrick)
+        {
+            int below = grid.NeighborIndex(index, 1, -1);
+            return below < 0 ? whenNoBrick : IsSolid(below, grid.CellPosition(below));
+        }
+
+        // Removes cells inside solid or a drain, cells holding (almost) nothing, and dim cells that have stopped gaining fill for too long
+        // (with gradualEvaporation, those lose evaporationPerSecond of fill per second instead, until nearly empty)
+        public void PruneStaleCells(float dt)
+        {
+            float evaporation = EvaporationStep(dt);
             lastPrunedBySolid = 0;
             lastPrunedByEmpty = 0;
             lastDrained = 0;
@@ -952,6 +1076,13 @@ namespace NAADF.World.Data
                 grid.ticksStagnant[i]++;
                 if (grid.ticksStagnant[i] >= stagnantTicksBeforeDestroy)
                 {
+                    float left = fill - evaporation;
+                    if (evaporation > 0f && left > minFillEpsilon)
+                    {
+                        grid.fill[i] = left;
+                        volumePrunedStagnant += fill - left;
+                        continue;
+                    }
                     grid.Untrack(i);
                     lastPrunedByEmpty++;
                     volumePrunedStagnant += fill;

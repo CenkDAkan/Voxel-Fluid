@@ -129,6 +129,7 @@ namespace NAADF.World.Data
         private readonly StageStatistics projectStatistics = new StageStatistics { name = "Project", tolerance = 1e-3f, comparesState = true };
         private readonly StageStatistics extrapolateStatistics = new StageStatistics { name = "Extrapolate", tolerance = 1e-6f, comparesState = true };
         private readonly StageStatistics fillStatistics = new StageStatistics { name = "AdvectFill", tolerance = 1e-6f, comparesState = true };
+        private readonly StageStatistics thinWaterStatistics = new StageStatistics { name = "ThinWater", tolerance = 1e-6f, comparesState = true };
         private readonly StageStatistics pruneStatistics = new StageStatistics { name = "Prune", tolerance = 1e-6f, comparesState = true };
         private readonly StageStatistics dampingStatistics = new StageStatistics { name = "Damping", tolerance = 1e-6f };
 
@@ -448,6 +449,9 @@ namespace NAADF.World.Data
             effect.Parameters["minFillEpsilon"].SetValue(SparseFluidSolver.minFillEpsilon);
             effect.Parameters["stagnantLimit"].SetValue(solver.stagnantTicksBeforeDestroy);
             effect.Parameters["keepSurfaceFilm"].SetValue(solver.keepSurfaceFilm ? 1 : 0);
+            effect.Parameters["thinWaterRate"].SetValue(solver.ThinWaterRate(dt));
+            effect.Parameters["thinWaterMinSpread"].SetValue(SparseFluidSolver.thinWaterMinSpreadFill);
+            effect.Parameters["evaporationStep"].SetValue(solver.EvaporationStep(dt));
         }
 
         // Runs one kernel of the effect with the given number of compute groups
@@ -537,14 +541,24 @@ namespace NAADF.World.Data
                 () => solver.AdvectFill(dt));
             start = AddStageTime(6, start);
 
+            if (solver.ThinWaterRate(dt) > 0f)
+                Stage(thinWaterStatistics, Arrays.None, Arrays.Fill | Arrays.State, StateTracked,
+                    () =>
+                    {
+                        Dispatch("ThinWaterFlow", slots);
+                        Dispatch("ThinWaterApply", slots);
+                    },
+                    () => solver.FlowThinWater(dt));
+            start = AddStageTime(7, start);
+
             Stage(pruneStatistics, Arrays.None, Arrays.Fill | Arrays.State, StateTracked | StateStagnant,
                 () =>
                 {
                     Dispatch("PruneStaleCells", slots);
                     SumBrickLedger(LedgerPrunedSolid, LedgerSize - LedgerPrunedSolid);
                 },
-                () => solver.PruneStaleCells());
-            start = AddStageTime(7, start);
+                () => solver.PruneStaleCells(dt));
+            start = AddStageTime(8, start);
 
             Stage(dampingStatistics, Arrays.None, Arrays.Faces, 0,
                 () => Dispatch("DampAndClampVelocity", slots),
@@ -553,7 +567,7 @@ namespace NAADF.World.Data
                     solver.ApplyDamping(dt);
                     solver.ClampVelocity(dt);
                 });
-            start = AddStageTime(8, start);
+            start = AddStageTime(9, start);
 
             if (!selfCheck)
                 ReadTickSummary();

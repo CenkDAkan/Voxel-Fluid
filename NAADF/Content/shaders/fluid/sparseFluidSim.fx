@@ -35,6 +35,7 @@
 #define LEDGER_COUNT_EMPTY 8
 #define LEDGER_COUNT_DRAINED 9
 #define LEDGER_SIZE 10
+#define KIND_EVAPORATED 11 // prune outcome: a stagnant cell lost some fill but stays
 
 // Slots of the scalars buffer
 #define SCALAR_RHO 0
@@ -61,6 +62,9 @@ float maxSpeed;
 float visibilityThreshold;
 int stagnantLimit; // ticks a dim cell may go without gaining fill
 int keepSurfaceFilm; // SparseFluidSolver.keepSurfaceFilm, 0 or 1
+float thinWaterRate;      // SparseFluidSolver.ThinWaterRate
+float thinWaterMinSpread; // SparseFluidSolver.thinWaterMinSpreadFill
+float evaporationStep;    // SparseFluidSolver.EvaporationStep, 0 removes stagnant cells at once
 int sourceCount;
 int previousSourceCount;
 int ledgerFirst;   // range of ledger slots sumBrickLedger adds up
@@ -1045,7 +1049,93 @@ void finishFill(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Thin water: dim cells resting on solid ground, away from liquid, pass fill to horizontal neighbors holding less and over edges
+// Same rules and arithmetic order as SparseFluidSolver.FlowThinWater, reads fill and cellState, writes fillRaw, then takes it over
+
+// Neighbor in the horizontal direction d: 0 = +X, 1 = -X, 2 = +Z, 3 = -Z
+int HorizontalNeighbor(int index, int d)
+{
+    return NeighborCell(index, d < 2 ? 0 : 2, (d & 1) == 0 ? 1 : -1);
+}
+
+// Whether the cell below is solid; whenNoBrick is the answer when no brick covers it
+bool SolidBelow(int index, bool whenNoBrick)
+{
+    int below = NeighborCell(index, 1, -1);
+    return below < 0 ? whenNoBrick : IsSolidCell(below);
+}
+
+// A dim cell resting on solid with no liquid or source cell beside or above it
+bool IsThinWater(int index)
+{
+    if (index < 0)
+        return false;
+    uint state = cellState[index];
+    if ((state & STATE_TRACKED) == 0 || (state & (STATE_LIQUID | STATE_SOURCE)) != 0)
+        return false;
+    float f = fill[index];
+    if (f <= minFillEpsilon || f >= liquidThreshold)
+        return false;
+    if (IsSolidCell(index) || !SolidBelow(index, false))
+        return false;
+
+    for (int d = 0; d < 4; d++)
+    {
+        int neighbor = HorizontalNeighbor(index, d);
+        if (IsLiquidCell(neighbor) || IsSourceCell(neighbor))
+            return false;
+    }
+    int above = NeighborCell(index, 1, 1);
+    return !IsLiquidCell(above) && !IsSourceCell(above);
+}
+
+// Fill the thin water cell from passes to its horizontal neighbor to this tick
+float ThinWaterFlow(int from, int to)
+{
+    if (!IsThinWater(from) || (cellState[to] & (STATE_LIQUID | STATE_SOURCE)) != 0)
+        return 0.0f;
+    float fromFill = fill[from];
+    float toFill = fill[to];
+    if (toFill >= fromFill)
+        return 0.0f;
+    if (IsSolidCell(to))
+        return 0.0f;
+    if (fromFill <= thinWaterMinSpread && SolidBelow(to, true))
+        return 0.0f;
+    precise float flow = thinWaterRate * (fromFill - toFill);
+    return flow;
+}
+
+// Per cell: fill after this tick's thin water exchange with its horizontal neighbors, into fillRaw
+[numthreads(8, 8, 8)]
+void thinWaterFlow(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    precise float delta = 0.0f;
+    for (int d = 0; d < 4; d++)
+    {
+        int neighbor = HorizontalNeighbor(index, d);
+        if (neighbor >= 0)
+            delta += ThinWaterFlow(neighbor, index) - ThinWaterFlow(index, neighbor);
+    }
+    precise float raw = fill[index] + delta;
+    fillRaw[index] = raw;
+}
+
+// Takes fillRaw over into fill; cells that received thin water become tracked
+[numthreads(8, 8, 8)]
+void thinWaterApply(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    float raw = fillRaw[index];
+    fillRw[index] = raw;
+    if (raw > 0.0f)
+        cellStateRw[index] |= STATE_TRACKED;
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Pruning: removes cells in a drain or in solid, cells holding (almost) nothing, and dim cells that went too long without gaining fill
+// (with evaporationStep > 0, those lose that much fill per tick instead, until nearly empty)
 
 // Whether the cell below is a liquid cell that this pass keeps (neither solid nor a drain), whatever order the cells run in
 bool RestsOnLiquid(int index)
@@ -1084,10 +1174,21 @@ void pruneStaleCells(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex
             uint ticks = min((state >> STATE_STAGNANT_SHIFT) + 1, 0xFFFF);
             state = (state & STATE_LOW_HALF) | (ticks << STATE_STAGNANT_SHIFT);
             if ((int) ticks >= stagnantLimit)
-                kind = LEDGER_PRUNED_STAGNANT;
+            {
+                precise float left = ownFill - evaporationStep;
+                if (evaporationStep > 0.0f && left > minFillEpsilon)
+                {
+                    kind = KIND_EVAPORATED;
+                    precise float lost = ownFill - left;
+                    volume = lost;
+                    fillRw[index] = left;
+                }
+                else
+                    kind = LEDGER_PRUNED_STAGNANT;
+            }
         }
 
-        if (kind != 0)
+        if (kind != 0 && kind != KIND_EVAPORATED)
         {
             volume = ownFill;
             fillRw[index] = 0.0f;
@@ -1108,7 +1209,7 @@ void pruneStaleCells(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex
         {
             uint localKind = sharedKind[local];
             float4 select = float4(localKind == LEDGER_PRUNED_SOLID, localKind == LEDGER_PRUNED_EMPTY, localKind == LEDGER_PRUNED_STAGNANT, localKind == LEDGER_DRAINED);
-            volumes += select * sharedA[local];
+            volumes += (select + float4(0.0f, 0.0f, localKind == KIND_EVAPORATED, 0.0f)) * sharedA[local];
             counts += select;
         }
 
@@ -1199,7 +1300,6 @@ technique Tech0
     {
         ComputeShader = compile cs_5_0 dampAndClampVelocity();
     }
-
     pass AdvectVelocity
     {
         ComputeShader = compile cs_5_0 advectVelocity();
@@ -1288,6 +1388,16 @@ technique Tech0
     pass PruneStaleCells
     {
         ComputeShader = compile cs_5_0 pruneStaleCells();
+    }
+
+    pass ThinWaterFlow
+    {
+        ComputeShader = compile cs_5_0 thinWaterFlow();
+    }
+
+    pass ThinWaterApply
+    {
+        ComputeShader = compile cs_5_0 thinWaterApply();
     }
 
     pass SumBrickLedger

@@ -243,8 +243,15 @@ namespace NAADF
             ImGui.SliderFloat("Top layer fill", ref basinTopFill, 0.05f, 1f, "%.2f");
             ImGuiCommon.HelperIcon("Fill of the top layer \"Fill basin\" seeds; 0.50 reproduces the half-full layer flicker. Without the debugging tools the top layer is filled completely.", 500);
 
-            ImGui.SliderInt("Stagnant ticks before destroy", ref handler.solver.stagnantTicksBeforeDestroy, 1, 300);
-            ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it's destroyed. Too low and a splash gets whittled away before it can consolidate into a resting puddle; too high and a genuinely thinning film on open ground lingers longer, tracked but invisible, before cleanup.", 500);
+            ImGui.SliderInt("Stagnant ticks", ref handler.solver.stagnantTicksBeforeDestroy, 1, 300);
+            ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it starts evaporating (or, with gradual evaporation off, is destroyed). Dim cells resting on liquid are never counted.", 500);
+
+            ImGui.Checkbox("Gradual evaporation", ref handler.solver.gradualEvaporation);
+            ImGui.SliderFloat("Evaporation per second", ref handler.solver.evaporationPerSecond, 0.005f, 0.5f, "%.3f");
+            ImGuiCommon.HelperIcon("On: a stagnant dim cell loses this much fill per second until it is nearly empty. Off: it is removed all at once.", 500);
+
+            ImGui.SliderFloat("Thin water flow", ref handler.solver.thinWaterFlowPerSecond, 0f, 10f, "%.1f");
+            ImGuiCommon.HelperIcon("How fast dim water resting on solid ground flows towards neighbours holding less and over edges, as the fraction per second of the fill difference. 0 turns it off; the water then stays where it landed.", 500);
 
             ImGui.Unindent();
         }
