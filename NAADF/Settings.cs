@@ -267,6 +267,9 @@ namespace NAADF
             ImGui.Checkbox("Extrapolate velocity into air", ref handler.solver.extrapolateIntoAir);
             ImGuiCommon.HelperIcon("Before velocity advection, faces next to the fluid that hold no velocity take the average of their neighbours (Bridson). Lets falling water keep its speed and shape; off, falling water caps at about 12 voxels/s and smears into mist.", 500);
 
+            ImGui.Checkbox("Donor-acceptor fill transport", ref handler.solver.donorAcceptorFill);
+            ImGuiCommon.HelperIcon("Fill moves with Hirt and Nichols' donor-acceptor fluxes, limited by flux-corrected transport so no cell overfills: a cell fills up before fluid enters an empty cell ahead of it, which keeps streams and drops sharp. Off: plain donor-cell fluxes, which smear fluid moving diagonally to the grid until streams fade from view.", 500);
+
             ImGui.SliderFloat("Thin water flow", ref handler.solver.thinWaterFlowPerSecond, 0f, 10f, "%.1f");
             ImGuiCommon.HelperIcon("How fast dim water resting on solid ground flows towards neighbours holding less and over edges, as the fraction per second of the fill difference. 0 turns it off; the water then stays where it landed.", 500);
 

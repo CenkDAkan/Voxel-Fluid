@@ -83,6 +83,7 @@ namespace NAADF.World.Data
         private StructuredBuffer diagBuffer, rBuffer, sBuffer, qBuffer;
         private StructuredBuffer brickSumBuffer, brickMaxBuffer, scalarsBuffer;
         private StructuredBuffer sealedLabelBuffer, sealedStatusBuffer, sealedSumsBuffer;
+        private IndirectDrawBuffer dispatchArgsBuffer;
         private StructuredBuffer fillOutTotalBuffer, fillOutScaledBuffer, fillInTotalBuffer, fillRawBuffer, fillStatusBuffer;
         private StructuredBuffer ledgerBuffer, brickLedgerBuffer, brickSummaryBuffer, visibleMaskBuffer;
         private StructuredBuffer sourceBuffer, previousSourceBuffer;
@@ -98,7 +99,12 @@ namespace NAADF.World.Data
         private readonly List<int> previousSourceCells = new List<int>();
         private int sourceCount;
         private readonly float[] scalarsReadback = new float[8];
-        private readonly uint[] sealedStatusReadback = new uint[4];
+        private readonly uint[] sealedStatusReadback = new uint[8];
+
+        // Same as the shader's SCALAR_* slots and the ARGS_* byte offsets into dispatchArgs
+        private const int ScalarResidual = 3, ScalarDone = 4, ScalarIterations = 5, ScalarSealedCells = 6, ScalarLabelsSettled = 7;
+        private const int ArgsLabels = 0, ArgsSealed = 12, ArgsPressure = 24;
+        private const int SealedStatusSettled = 3;
 
         // Same slots as the shader's ledger
         private const int LedgerInjected = 0, LedgerClampedAway = 1, LedgerClampCreated = 2, LedgerPrunedSolid = 3, LedgerPrunedEmpty = 4,
@@ -219,6 +225,7 @@ namespace NAADF.World.Data
             sealedLabelBuffer = CreateBuffer(typeof(uint), gridCells);
             sealedStatusBuffer = CreateBuffer(typeof(uint), sealedStatusReadback.Length);
             sealedSumsBuffer = CreateBuffer(typeof(uint), sealedMaxGroups * 4);
+            dispatchArgsBuffer = new IndirectDrawBuffer(device, BufferUsage.None, ShaderAccess.ReadWrite, 9);
             fillOutTotalBuffer = CreateBuffer(typeof(float), gridCells);
             fillOutScaledBuffer = CreateBuffer(typeof(float), gridCells);
             fillInTotalBuffer = CreateBuffer(typeof(float), gridCells);
@@ -480,11 +487,20 @@ namespace NAADF.World.Data
             effect.Parameters["sealedLabel"].SetValue(sealedLabelBuffer);
             effect.Parameters["sealedStatus"].SetValue(sealedStatusBuffer);
             effect.Parameters["sealedSums"].SetValue(sealedSumsBuffer);
+            effect.Parameters["dispatchArgs"].SetValue(dispatchArgsBuffer);
             effect.Parameters["fillOutTotal"].SetValue(fillOutTotalBuffer);
             effect.Parameters["fillOutScaled"].SetValue(fillOutScaledBuffer);
             effect.Parameters["fillInTotal"].SetValue(fillInTotalBuffer);
             effect.Parameters["fillRaw"].SetValue(fillRawBuffer);
             effect.Parameters["fillStatus"].SetValue(fillStatusBuffer);
+
+            // The donor-acceptor correction sums live in the pressure solve's vectors, unused between Project and the next buildSystem
+            effect.Parameters["fillLowDelta"].SetValue(rBuffer);
+            effect.Parameters["fillLowDeltaRw"].SetValue(rBuffer);
+            effect.Parameters["fillGains"].SetValue(sBuffer);
+            effect.Parameters["fillGainsRw"].SetValue(sBuffer);
+            effect.Parameters["fillLosses"].SetValue(qBuffer);
+            effect.Parameters["fillLossesRw"].SetValue(qBuffer);
             effect.Parameters["ledger"].SetValue(ledgerBuffer);
             effect.Parameters["brickLedger"].SetValue(brickLedgerBuffer);
             effect.Parameters["brickSummary"].SetValue(brickSummaryBuffer);
@@ -508,6 +524,7 @@ namespace NAADF.World.Data
             effect.Parameters["minFillEpsilon"].SetValue(SparseFluidSolver.minFillEpsilon);
             effect.Parameters["stagnantLimit"].SetValue(solver.stagnantTicksBeforeDestroy);
             effect.Parameters["keepSurfaceFilm"].SetValue(solver.keepSurfaceFilm ? 1 : 0);
+            effect.Parameters["donorAcceptorFill"].SetValue(solver.donorAcceptorFill ? 1 : 0);
             effect.Parameters["thinWaterRate"].SetValue(solver.ThinWaterRate(dt));
             effect.Parameters["thinWaterMinSpread"].SetValue(SparseFluidSolver.thinWaterMinSpreadFill);
             effect.Parameters["evaporationStep"].SetValue(solver.EvaporationStep(dt));
@@ -518,6 +535,13 @@ namespace NAADF.World.Data
         {
             effect.Techniques[0].Passes[pass].ApplyCompute();
             device.DispatchCompute(groups, 1, 1);
+        }
+
+        // Runs one kernel with the group count the shader left at the given byte offset of dispatchArgs
+        private void DispatchIndirect(string pass, int argsOffset)
+        {
+            effect.Techniques[0].Passes[pass].ApplyCompute();
+            device.DispatchComputeIndirect(dispatchArgsBuffer, argsOffset);
         }
 
         // Start of a kernel timing: with measureKernels on, first waits until the GPU has finished all earlier work
@@ -593,6 +617,8 @@ namespace NAADF.World.Data
                 {
                     Dispatch("FillOutflow", slots);
                     Dispatch("FillInflow", slots);
+                    if (solver.donorAcceptorFill)
+                        Dispatch("FillCorrectionTotals", slots);
                     Dispatch("FillApply", slots);
                     Dispatch("FinishFill", slots);
                     SumBrickLedger(LedgerClampedAway, 2);
@@ -818,41 +844,46 @@ namespace NAADF.World.Data
         }
 
         // Classifies the liquid cells, solves for pressure in batches of iterations until converged, and applies the pressure to the faces
+        // The sealed labels and the first batch go out without waiting on the GPU, which skips whatever turns out not to be needed
+        // the CPU reads the outcome once, and only sends more when the labels or the solve aren't finished
         private void ProjectKernels()
         {
             Dispatch("ClassifyLiquid", slots);
             Dispatch("MarkLiquidNeighbors", slots);
             Dispatch("ZeroSolidFaces", slots);
             Dispatch("BuildSystem", slots);
-            int sealedCells = RemoveSealedMeans();
+            Dispatch("InitSealedLabels", slots);
+            Dispatch("StartSealedLabels", 1);
+            DispatchLabelRounds(labelRounds);
+            DispatchSealedMeans();
             Dispatch("FinalizeStart", 1);
+            int dispatched = DispatchPressureBatch(0);
+            ReadScalars();
 
-            // The starting residual decides whether any iterations are needed at all
-            scalarsBuffer.GetData(scalarsReadback, 0, scalarsReadback.Length);
-            bool converged = scalarsReadback[4] != 0f;
-            int dispatched = 0;
+            int rounds = labelRounds;
+            if (scalarsReadback[ScalarLabelsSettled] == 0f)
+            {
+                // The labels needed more rounds: FinalizeStart held the solve back, so it starts over once they have settled
+                rounds = FinishSealedLabels(rounds);
+                DispatchSealedMeans();
+                Dispatch("FinalizeStart", 1);
+                ReadScalars();
+                dispatched = 0;
+            }
+            labelRounds = Math.Clamp(rounds, minLabelRounds, maxLabelRounds);
+
+            bool converged = scalarsReadback[ScalarDone] != 0f;
             while (!converged && dispatched < maxPressureIterations)
             {
                 if (dispatched > 0)
                     projectStatistics.extraBatches++;
-
-                int batch = Math.Min(pressureIterations, maxPressureIterations - dispatched);
-                for (int iteration = 0; iteration < batch; iteration++)
-                {
-                    Dispatch("ApplyA", slots);
-                    Dispatch("FinalizeAlpha", 1);
-                    Dispatch("UpdateSolution", slots);
-                    Dispatch("FinalizeBeta", 1);
-                    Dispatch("UpdateDirection", slots);
-                }
-                dispatched += batch;
-
-                scalarsBuffer.GetData(scalarsReadback, 0, scalarsReadback.Length);
-                converged = scalarsReadback[4] != 0f;
+                dispatched += DispatchPressureBatch(dispatched);
+                ReadScalars();
+                converged = scalarsReadback[ScalarDone] != 0f;
             }
             Dispatch("SubtractPressureGradient", slots);
 
-            int gpuIterations = (int)scalarsReadback[5];
+            int gpuIterations = (int)scalarsReadback[ScalarIterations];
             projectStatistics.gpuIterations += gpuIterations;
             if (!converged)
                 projectStatistics.unconvergedTicks++;
@@ -861,40 +892,66 @@ namespace NAADF.World.Data
             if (!selfCheck)
             {
                 solver.lastPressureIterations = gpuIterations;
-                solver.lastPressureResidual = scalarsReadback[3];
-                solver.lastSealedCells = sealedCells;
+                solver.lastPressureResidual = scalarsReadback[ScalarResidual];
+                solver.lastSealedCells = (int)scalarsReadback[ScalarSealedCells];
             }
         }
 
-        // Finds the groups of liquid cells with no air neighbor and takes each one's mean out of the starting residual, as
-        // SparseFluidSolver.RemoveSealedMeans does with b, returns the number of sealed liquid cells
-        private int RemoveSealedMeans()
+        // Waits for the GPU and reads the solve's scalars
+        private void ReadScalars()
         {
-            Dispatch("InitSealedLabels", slots);
-            int rounds = 0;
-            bool changed = true;
-            while (changed && rounds < maxLabelRounds)
+            scalarsBuffer.GetData(scalarsReadback, 0, scalarsReadback.Length);
+        }
+
+        // Dispatches the next batch of conjugate gradient iterations, sized from what the previous tick needed, returns its size
+        private int DispatchPressureBatch(int dispatched)
+        {
+            int batch = Math.Min(pressureIterations, maxPressureIterations - dispatched);
+            for (int iteration = 0; iteration < batch; iteration++)
+            {
+                DispatchIndirect("ApplyA", ArgsPressure);
+                Dispatch("FinalizeAlpha", 1);
+                DispatchIndirect("UpdateSolution", ArgsPressure);
+                Dispatch("FinalizeBeta", 1);
+                DispatchIndirect("UpdateDirection", ArgsPressure);
+            }
+            return batch;
+        }
+
+        // Rounds of sealed-label propagation, the rounds after one that changed nothing run over no slots
+        private void DispatchLabelRounds(int count)
+        {
+            for (int round = 0; round < count; round++)
+            {
+                DispatchIndirect("PropagateSealedLabels", ArgsLabels);
+                Dispatch("FinishLabelRound", 1);
+            }
+        }
+
+        // Dispatches further batches of label rounds until they have settled or the round limit is reached, returns the rounds dispatched in all
+        private int FinishSealedLabels(int rounds)
+        {
+            bool settled = false;
+            while (!settled && rounds < maxLabelRounds)
             {
                 int batch = Math.Min(labelRounds, maxLabelRounds - rounds);
-                for (int round = 0; round < batch; round++)
-                {
-                    Dispatch("ResetSealedStatus", 1);
-                    Dispatch("PropagateSealedLabels", slots);
-                }
+                DispatchLabelRounds(batch);
                 rounds += batch;
                 sealedStatusBuffer.GetData(sealedStatusReadback, 0, sealedStatusReadback.Length);
-                changed = sealedStatusReadback[0] != 0;
+                settled = sealedStatusReadback[SealedStatusSettled] != 0;
             }
-            labelRounds = Math.Clamp(rounds, minLabelRounds, maxLabelRounds);
+            if (!settled)
+                Dispatch("ForceSettleSealedLabels", 1);
+            return rounds;
+        }
 
-            int sealedCells = (int)sealedStatusReadback[1];
-            if (sealedCells == 0)
-                return 0;
-
-            Dispatch("AssignSealedGroups", slots);
-            Dispatch("SumSealedResiduals", slots);
-            Dispatch("RemoveSealedMeans", slots);
-            return sealedCells;
+        // Finds the groups of liquid cells with no air neighbor and takes each one's mean out of the starting residual, as
+        // SparseFluidSolver.RemoveSealedMeans does with b; runs over no slots unless the labels have settled with sealed cells
+        private void DispatchSealedMeans()
+        {
+            DispatchIndirect("AssignSealedGroups", ArgsSealed);
+            DispatchIndirect("SumSealedResiduals", ArgsSealed);
+            DispatchIndirect("RemoveSealedMeans", ArgsSealed);
         }
 
         // Adds the per-brick parts of a range of ledger slots to the tick's ledger
@@ -989,6 +1046,7 @@ namespace NAADF.World.Data
             scalarsBuffer?.Dispose();
             sealedLabelBuffer?.Dispose();
             sealedStatusBuffer?.Dispose();
+            dispatchArgsBuffer?.Dispose();
             sealedSumsBuffer?.Dispose();
             fillOutTotalBuffer?.Dispose();
             fillOutScaledBuffer?.Dispose();

@@ -26,6 +26,7 @@ namespace NAADF.World.Data
         {
             public int donor, receiver;
             public float amount;
+            public float correction; // donor-acceptor amount minus the donor-cell amount, see donorAcceptorFill
         }
 
         private struct FaceUpdate
@@ -95,6 +96,10 @@ namespace NAADF.World.Data
 
         // Velocity advection first fills the faces next to the fluid that aren't present with the average of their present neighbors (Bridson)
         public bool extrapolateIntoAir = true;
+
+        // Fill transport moves the donor-cell fluxes towards Hirt and Nichols' donor-acceptor fluxes, which keep the fluid's surface sharp,
+        // as far as flux-corrected transport (Zalesak) allows without any cell leaving [0,1]; off, plain donor-cell fluxes
+        public bool donorAcceptorFill = true;
 
         // Stagnant dim cells lose evaporationPerSecond of fill per second instead of being removed all at once
         public bool gradualEvaporation = true;
@@ -900,7 +905,107 @@ namespace NAADF.World.Data
             lastPressureResidual = (float)residual;
         }
 
-        // Donor-cell face fluxes using the face velocity directly; whatever leaves one side of a face enters the other
+        // Hirt and Nichols' (1981) donor-acceptor flux: the fill moving from donor to acceptor through a face whose flux moves volume (0, 1].
+        // The fill that sets the flowing part of the face is the acceptor's when the surface moves mostly normal to itself, or when the acceptor
+        // or the cell upstream of the donor is empty, otherwise the donor's; upstreamDirection steps from the donor away from the acceptor.
+        // A donor with empty cells on both sides along the flux is a fragment with no side its fluid is packed against, and keeps the donor's
+        // fill (plain donor-cell), as the acceptor's would hold it in place for good
+        private float DonorAcceptorAmount(int axis, int donor, Point3 donorPos, float acceptorFill, float volume, int upstreamDirection)
+        {
+            float donorFill = grid.fill[donor];
+            bool acceptorEmpty = acceptorFill <= minFillEpsilon;
+            bool upstreamEmpty = IsEmptyNeighbor(donor, donorPos, axis, upstreamDirection);
+            bool useAcceptor = !(acceptorEmpty && upstreamEmpty)
+                && (acceptorEmpty || upstreamEmpty || SurfaceFacesAxis(donor, donorPos, donorFill, axis));
+            float flowingFill = useAcceptor ? acceptorFill : donorFill;
+            float extra = MathF.Max((1f - flowingFill) * volume - (1f - donorFill), 0f);
+            return MathF.Min(flowingFill * volume + extra, donorFill);
+        }
+
+        // Whether the neighbor one step along axis holds no fluid and isn't solid
+        private bool IsEmptyNeighbor(int index, Point3 pos, int axis, int direction)
+        {
+            int neighbor = grid.NeighborIndex(index, axis, direction);
+            if (neighbor >= 0 && grid.fill[neighbor] > minFillEpsilon)
+                return false;
+            return !IsSolid(neighbor, pos + SparseFluidGrid.AxisOffsets[axis] * direction);
+        }
+
+        // Whether the fill gradient around a cell is largest along axis, i.e. its surface faces that axis, solid neighbors count as holding the cell's own fill
+        private bool SurfaceFacesAxis(int index, Point3 pos, float ownFill, int axis)
+        {
+            float along = 0f, largestOther = 0f;
+            for (int a = 0; a < 3; a++)
+            {
+                float gradient = MathF.Abs(NeighborFillOrOwn(index, pos, a, -1, ownFill) - NeighborFillOrOwn(index, pos, a, 1, ownFill));
+                if (a == axis)
+                    along = gradient;
+                else
+                    largestOther = MathF.Max(largestOther, gradient);
+            }
+            return along > 0f && along >= largestOther;
+        }
+
+        // The fill of the neighbor one step along axis, the given fill when that neighbor is solid
+        private float NeighborFillOrOwn(int index, Point3 pos, int axis, int direction, float ownFill)
+        {
+            int neighbor = grid.NeighborIndex(index, axis, direction);
+            if (IsSolid(neighbor, pos + SparseFluidGrid.AxisOffsets[axis] * direction))
+                return ownFill;
+            return neighbor >= 0 ? grid.fill[neighbor] : 0f;
+        }
+
+        // Flux-corrected transport on top of the bounded donor-cell transfers: each transfer's correction towards its donor-acceptor
+        // amount is scaled so that no cell can end up above full or below empty, by the smaller of the gaining cell's and the losing cell's factor
+        private void ApplyLimitedCorrections(int count)
+        {
+            float[] fill = grid.fill, gains = grid.inTotal, losses = grid.outScaled, delta = grid.delta;
+
+            // Fill after the donor-cell transfers alone, as fill + delta, and per cell the sum of the corrections that would raise and lower it
+            for (int k = 0; k < count; k++)
+            {
+                Transfer t = transfers[k];
+                delta[t.donor] -= t.amount;
+                delta[t.receiver] += t.amount;
+                gains[t.donor] = gains[t.receiver] = 0f;
+                losses[t.donor] = losses[t.receiver] = 0f;
+            }
+            for (int k = 0; k < count; k++)
+            {
+                Transfer t = transfers[k];
+                if (t.correction > 0f)
+                {
+                    gains[t.receiver] += t.correction;
+                    losses[t.donor] += t.correction;
+                }
+                else if (t.correction < 0f)
+                {
+                    gains[t.donor] -= t.correction;
+                    losses[t.receiver] -= t.correction;
+                }
+            }
+
+            for (int k = 0; k < count; k++)
+            {
+                Transfer t = transfers[k];
+                if (t.correction == 0f)
+                    continue;
+                int gainer = t.correction > 0f ? t.receiver : t.donor;
+                int loser = t.correction > 0f ? t.donor : t.receiver;
+                float raise = MathF.Min(1f, MathF.Max(1f - (fill[gainer] + delta[gainer]), 0f) / gains[gainer]);
+                float lower = MathF.Min(1f, MathF.Max(fill[loser] + delta[loser], 0f) / losses[loser]);
+                t.amount += MathF.Min(raise, lower) * t.correction;
+                transfers[k] = t;
+            }
+
+            for (int k = 0; k < count; k++)
+            {
+                Transfer t = transfers[k];
+                delta[t.donor] = delta[t.receiver] = 0f;
+            }
+        }
+
+        // Donor-cell (or donor-acceptor, see donorAcceptorFill) face fluxes using the face velocity directly, whatever leaves one side of a face enters the other
         // Bounded: each donor's total outflow is scaled to what it holds, then each receiver's total inflow is scaled to its free space
         public void AdvectFill(float dt)
         {
@@ -932,12 +1037,18 @@ namespace NAADF.World.Data
 
                     if (flux > 0f)
                     {
+                        float amount = flux * lowerFill;
+                        float correction = donorAcceptorFill ? DonorAcceptorAmount(axis, i, lowerPos, upperFill, flux, -1) - amount : 0f;
                         if (upper < 0)
                             upper = grid.EnsureCellIndex(upperPos);
-                        transfers.Add(new Transfer { donor = i, receiver = upper, amount = flux * lowerFill });
+                        transfers.Add(new Transfer { donor = i, receiver = upper, amount = amount, correction = correction });
                     }
                     else
-                        transfers.Add(new Transfer { donor = upper, receiver = i, amount = -flux * upperFill });
+                    {
+                        float amount = -flux * upperFill;
+                        float correction = donorAcceptorFill ? DonorAcceptorAmount(axis, upper, upperPos, lowerFill, -flux, 1) - amount : 0f;
+                        transfers.Add(new Transfer { donor = upper, receiver = i, amount = amount, correction = correction });
+                    }
                 }
             }
 
@@ -977,11 +1088,14 @@ namespace NAADF.World.Data
                 }
             }
 
+            if (donorAcceptorFill)
+                ApplyLimitedCorrections(count);
+
             touchedList.Clear();
             for (int k = 0; k < count; k++)
             {
                 Transfer t = transfers[k];
-                if (t.amount < minFillEpsilon && fill[t.receiver] <= minFillEpsilon && !(keepSurfaceFilm && (flags[t.donor] & FlagLiquid) != 0))
+                if (t.amount >= 0f && t.amount < minFillEpsilon && fill[t.receiver] <= minFillEpsilon && !(keepSurfaceFilm && (flags[t.donor] & FlagLiquid) != 0))
                     continue; // don't create new cells from negligible amounts
 
                 delta[t.donor] -= t.amount;

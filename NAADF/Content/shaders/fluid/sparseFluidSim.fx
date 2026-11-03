@@ -45,6 +45,13 @@
 #define SCALAR_RESIDUAL 3
 #define SCALAR_DONE 4
 #define SCALAR_ITERATIONS 5
+#define SCALAR_SEALED_CELLS 6    // copied from sealedStatus by finalizeStart, so one read of scalars tells the CPU everything
+#define SCALAR_LABELS_SETTLED 7
+
+// Byte offsets of the group counts in dispatchArgs, for the kernels dispatched indirectly
+#define ARGS_LABELS 0   // propagateSealedLabels: every slot until a round changes nothing
+#define ARGS_SEALED 12  // assignSealedGroups, sumSealedResiduals, removeSealedMeans: every slot once settled with sealed cells
+#define ARGS_PRESSURE 24 // applyA, updateSolution, updateDirection: every slot until the solve is done
 
 // Sealed liquid labels: 0 = not liquid, LABEL_OPEN = connected to air, otherwise the lowest cell index of the group + 2;
 // once the labels have settled, the lowest cell's own label is LABEL_ROOT | its group number
@@ -54,6 +61,8 @@
 #define SEALED_STATUS_CHANGED 0
 #define SEALED_STATUS_CELLS 1
 #define SEALED_STATUS_GROUPS 2
+#define SEALED_STATUS_SETTLED 3
+#define SEALED_STATUS_ROUND_CELLS 4 // sealed cells counted by the last round that changed labels
 #define SEALED_MAX_GROUPS 4096
 #define SEALED_FIXED_SCALE 65536.0
 
@@ -74,6 +83,7 @@ float maxSpeed;
 float visibilityThreshold;
 int stagnantLimit; // ticks a dim cell may go without gaining fill
 int keepSurfaceFilm; // SparseFluidSolver.keepSurfaceFilm, 0 or 1
+int donorAcceptorFill; // SparseFluidSolver.donorAcceptorFill, 0 or 1
 float thinWaterRate;      // SparseFluidSolver.ThinWaterRate
 float thinWaterMinSpread; // SparseFluidSolver.thinWaterMinSpreadFill
 float evaporationStep;    // SparseFluidSolver.EvaporationStep, 0 removes stagnant cells at once
@@ -116,6 +126,7 @@ RWStructuredBuffer<float> scalars;
 RWStructuredBuffer<uint> sealedLabel;  // per cell, see LABEL_OPEN
 RWStructuredBuffer<uint> sealedStatus; // SEALED_STATUS_* counters
 RWStructuredBuffer<uint> sealedSums;   // four per group: low byte, second byte and the signed rest of the fixed-point residual sum, then the cell count
+RWByteAddressBuffer dispatchArgs;      // group counts at the ARGS_* offsets
 
 // Fill transport: per-cell totals of the transfers out of and into a cell, then the result
 RWStructuredBuffer<float> fillOutTotal;  // outflow as the face velocities ask for it
@@ -123,6 +134,14 @@ RWStructuredBuffer<float> fillOutScaled; // outflow once limited to what the cel
 RWStructuredBuffer<float> fillInTotal;   // inflow, from donors already limited
 RWStructuredBuffer<float> fillRaw;       // fill after transport, not yet clamped to [0,1]
 RWStructuredBuffer<uint> fillStatus;     // FILL_TOUCHED / FILL_GAINED
+
+// Donor-acceptor corrections (see fillCorrectionTotals), held in the pressure solve's vectors, which buildSystem overwrites every tick
+StructuredBuffer<float> fillLowDelta;    // change in fill from the donor-cell transfers alone
+StructuredBuffer<float> fillGains;       // sum of the corrections that would raise the cell
+StructuredBuffer<float> fillLosses;      // sum of the corrections that would lower the cell
+RWStructuredBuffer<float> fillLowDeltaRw;
+RWStructuredBuffer<float> fillGainsRw;
+RWStructuredBuffer<float> fillLossesRw;
 
 // Sources: eight ints per source cell (its index, the indices of its lower neighbors along x, y, z, then the velocity's three floats as bits)
 StructuredBuffer<int> sourceCells;
@@ -705,13 +724,50 @@ void initSealedLabels(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupInde
     sealedLabel[index] = label;
 }
 
-// Clears the counters of one propagation round
+// Clears the counters before the first propagation round, which then runs over every slot, and holds back the sealed-mean kernels
 [numthreads(1, 1, 1)]
-void resetSealedStatus()
+void startSealedLabels()
 {
     sealedStatus[SEALED_STATUS_CHANGED] = 0;
     sealedStatus[SEALED_STATUS_CELLS] = 0;
     sealedStatus[SEALED_STATUS_GROUPS] = 0;
+    sealedStatus[SEALED_STATUS_SETTLED] = 0;
+    sealedStatus[SEALED_STATUS_ROUND_CELLS] = 0;
+    dispatchArgs.Store3(ARGS_LABELS, uint3((uint) slotCount, 1, 1));
+    dispatchArgs.Store3(ARGS_SEALED, uint3(0, 1, 1));
+}
+
+// Marks the labels final with the given number of sealed cells: no further rounds, and the sealed-mean kernels run if there are any
+void SettleSealedLabels(uint sealedCells)
+{
+    sealedStatus[SEALED_STATUS_CELLS] = sealedCells;
+    sealedStatus[SEALED_STATUS_SETTLED] = 1;
+    dispatchArgs.Store(ARGS_LABELS, 0);
+    dispatchArgs.Store3(ARGS_SEALED, uint3(sealedCells > 0 ? (uint) slotCount : 0, 1, 1));
+}
+
+// After each propagation round: settles the labels if the round changed nothing, otherwise clears its counters for the next one
+[numthreads(1, 1, 1)]
+void finishLabelRound()
+{
+    if (sealedStatus[SEALED_STATUS_SETTLED] != 0)
+        return;
+    if (sealedStatus[SEALED_STATUS_CHANGED] == 0)
+    {
+        SettleSealedLabels(sealedStatus[SEALED_STATUS_CELLS]);
+        return;
+    }
+    sealedStatus[SEALED_STATUS_CHANGED] = 0;
+    sealedStatus[SEALED_STATUS_ROUND_CELLS] = sealedStatus[SEALED_STATUS_CELLS];
+    sealedStatus[SEALED_STATUS_CELLS] = 0;
+}
+
+// When the round limit is reached: takes the labels as they are, with the cell count of the last round
+[numthreads(1, 1, 1)]
+void forceSettleSealedLabels()
+{
+    if (sealedStatus[SEALED_STATUS_SETTLED] == 0)
+        SettleSealedLabels(sealedStatus[SEALED_STATUS_ROUND_CELLS]);
 }
 
 // One round: each liquid cell takes the lowest label of its liquid neighbors in other bricks once, then of those in its own brick
@@ -928,7 +984,15 @@ void ReduceBricks(uint thread, out float sum, out float largest)
     }
 }
 
-// After buildSystem: starting rho and residual
+// Stops the iterations dispatched after this point
+void FinishSolve()
+{
+    scalars[SCALAR_DONE] = 1.0f;
+    dispatchArgs.Store(ARGS_PRESSURE, 0);
+}
+
+// After buildSystem and the sealed means: starting rho and residual, and the sealed-label outcome for the CPU
+// Labels that haven't settled yet leave the solve marked done before it starts, so the CPU can finish them and start the solve again
 [numthreads(REDUCE_THREADS, 1, 1)]
 void finalizeStart(uint3 threadID : SV_GroupThreadID)
 {
@@ -937,12 +1001,18 @@ void finalizeStart(uint3 threadID : SV_GroupThreadID)
     if (threadID.x != 0)
         return;
 
+    bool settled = sealedStatus[SEALED_STATUS_SETTLED] != 0;
     scalars[SCALAR_RHO] = sum;
     scalars[SCALAR_ALPHA] = 0.0f;
     scalars[SCALAR_BETA] = 0.0f;
     scalars[SCALAR_RESIDUAL] = residual;
-    scalars[SCALAR_DONE] = residual <= pressureTolerance ? 1.0f : 0.0f;
     scalars[SCALAR_ITERATIONS] = 0.0f;
+    scalars[SCALAR_SEALED_CELLS] = (float) sealedStatus[SEALED_STATUS_CELLS];
+    scalars[SCALAR_LABELS_SETTLED] = settled ? 1.0f : 0.0f;
+    scalars[SCALAR_DONE] = 0.0f;
+    dispatchArgs.Store3(ARGS_PRESSURE, uint3((uint) slotCount, 1, 1));
+    if (!settled || residual <= pressureTolerance)
+        FinishSolve();
 }
 
 // After applyA: step length alpha = rho / (s . q)
@@ -963,7 +1033,7 @@ void finalizeAlpha(uint3 threadID : SV_GroupThreadID)
     if (abs(sq) < 1e-30f)
     {
         scalars[SCALAR_ALPHA] = 0.0f;
-        scalars[SCALAR_DONE] = 1.0f;
+        FinishSolve();
         return;
     }
     scalars[SCALAR_ALPHA] = scalars[SCALAR_RHO] / sq;
@@ -1013,7 +1083,7 @@ void finalizeBeta(uint3 threadID : SV_GroupThreadID)
     scalars[SCALAR_RESIDUAL] = residual;
     if (residual <= pressureTolerance)
     {
-        scalars[SCALAR_DONE] = 1.0f;
+        FinishSolve();
         return;
     }
 
@@ -1230,6 +1300,76 @@ float DonorLimited(float amount, int donor)
     return limited;
 }
 
+// A donor-limited transfer once its receiver's total inflow has been limited to its free space, counting what it gives away itself
+float ReceiverLimited(float amount, int receiver)
+{
+    float incoming = fillInTotal[receiver];
+    precise float space = 1.0f - fill[receiver] + fillOutScaled[receiver];
+    precise float limited = amount;
+    if (incoming > space)
+        limited = ScaleExact(amount, max(space, 0.0f), incoming);
+    return limited;
+}
+
+// The fill of the neighbor one step along an axis, the given fill when that neighbor is solid, 0 when no brick covers it
+float NeighborFillOrOwn(int index, int axis, int direction, float ownFill)
+{
+    int neighbor = NeighborCell(index, axis, direction);
+    if (IsSolidCell(neighbor))
+        return ownFill;
+    return neighbor >= 0 ? fill[neighbor] : 0.0f;
+}
+
+// Whether the neighbor one step along an axis holds no fluid and isn't solid
+bool IsEmptyNeighbor(int index, int axis, int direction)
+{
+    int neighbor = NeighborCell(index, axis, direction);
+    if (neighbor >= 0 && fill[neighbor] > minFillEpsilon)
+        return false;
+    return !IsSolidCell(neighbor);
+}
+
+// Whether the fill gradient around a cell is largest along the axis, i.e. its surface faces that axis
+bool SurfaceFacesAxis(int index, float ownFill, int axis)
+{
+    float along = 0.0f;
+    float largestOther = 0.0f;
+    for (int a = 0; a < 3; a++)
+    {
+        precise float gradient = abs(NeighborFillOrOwn(index, a, -1, ownFill) - NeighborFillOrOwn(index, a, 1, ownFill));
+        if (a == axis)
+            along = gradient;
+        else
+            largestOther = max(largestOther, gradient);
+    }
+    return along > 0.0f && along >= largestOther;
+}
+
+// Same as SparseFluidSolver.DonorAcceptorAmount: Hirt and Nichols' flux of fill from donor to acceptor for a face moving volume (0, 1]
+float DonorAcceptorAmount(int axis, int donor, float acceptorFill, float volume, int upstreamDirection)
+{
+    float donorFill = fill[donor];
+    bool acceptorEmpty = acceptorFill <= minFillEpsilon;
+    bool upstreamEmpty = IsEmptyNeighbor(donor, axis, upstreamDirection);
+    bool useAcceptor = !(acceptorEmpty && upstreamEmpty) && (acceptorEmpty || upstreamEmpty || SurfaceFacesAxis(donor, donorFill, axis));
+    float flowingFill = useAcceptor ? acceptorFill : donorFill;
+    precise float extra = max((1.0f - flowingFill) * volume - (1.0f - donorFill), 0.0f);
+    precise float amount = min(flowingFill * volume + extra, donorFill);
+    return amount;
+}
+
+// The donor-acceptor amount minus the donor-cell amount of a face with the given FaceTransfer (not zero), towards the transfer's receiver
+float TransferCorrection(int lower, int upper, int axis, float transfer)
+{
+    precise float flux = clamp(ReadFace(axis, lower) * dt, -1.0f, 1.0f);
+    precise float correction;
+    if (transfer > 0.0f)
+        correction = DonorAcceptorAmount(axis, lower, fill[upper], flux, -1) - transfer;
+    else
+        correction = DonorAcceptorAmount(axis, upper, fill[lower], -flux, 1) - (-transfer);
+    return correction;
+}
+
 // Per cell: total outflow as the faces ask for it, and the outflow once limited to what the cell holds
 [numthreads(8, 8, 8)]
 void fillOutflow(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
@@ -1286,6 +1426,53 @@ void fillInflow(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
     fillInTotal[index] = total;
 }
 
+// With donor-acceptor fill: per cell, the change in fill from the donor-cell transfers once both limits apply, and the sums of the
+// corrections that would raise and lower it, as SparseFluidSolver.ApplyLimitedCorrections gathers them
+[numthreads(8, 8, 8)]
+void fillCorrectionTotals(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    CellFaces faces = FacesOf(index);
+
+    precise float delta = 0.0f;
+    precise float gains = 0.0f;
+    precise float losses = 0.0f;
+    for (int n = 0; n < 6; n++)
+    {
+        int k = faces.order[n];
+        float transfer = FaceTransfer(faces.lower[k], faces.upper[k], faces.axis[k]);
+        if (transfer == 0.0f)
+            continue;
+
+        int donor = transfer > 0.0f ? faces.lower[k] : faces.upper[k];
+        int receiver = transfer > 0.0f ? faces.upper[k] : faces.lower[k];
+        float amount = ReceiverLimited(DonorLimited(abs(transfer), donor), receiver);
+        if (donor == index)
+            delta -= amount;
+        else
+            delta += amount;
+
+        float correction = TransferCorrection(faces.lower[k], faces.upper[k], faces.axis[k], transfer);
+        if (correction > 0.0f)
+        {
+            if (receiver == index)
+                gains += correction;
+            else
+                losses += correction;
+        }
+        else if (correction < 0.0f)
+        {
+            if (donor == index)
+                gains -= correction;
+            else
+                losses -= correction;
+        }
+    }
+    fillLowDeltaRw[index] = delta;
+    fillGainsRw[index] = gains;
+    fillLossesRw[index] = losses;
+}
+
 // Per cell: the change in fill from all its transfers once both limits apply, into fillRaw and fillStatus
 [numthreads(8, 8, 8)]
 void fillApply(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
@@ -1304,16 +1491,27 @@ void fillApply(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 
         int donor = transfer > 0.0f ? faces.lower[k] : faces.upper[k];
         int receiver = transfer > 0.0f ? faces.upper[k] : faces.lower[k];
-        precise float amount = DonorLimited(abs(transfer), donor);
+        precise float amount = ReceiverLimited(DonorLimited(abs(transfer), donor), receiver);
 
-        // The receiver's total inflow is limited to its free space, counting what it gives away itself
-        float incoming = fillInTotal[receiver];
-        precise float space = 1.0f - fill[receiver] + fillOutScaled[receiver];
-        if (incoming > space)
-            amount = ScaleExact(amount, max(space, 0.0f), incoming);
+        // The correction towards the donor-acceptor amount, scaled so that neither the cell it raises nor the one it lowers leaves [0,1]
+        if (donorAcceptorFill != 0)
+        {
+            float correction = TransferCorrection(faces.lower[k], faces.upper[k], faces.axis[k], transfer);
+            if (correction != 0.0f)
+            {
+                int gainer = correction > 0.0f ? receiver : donor;
+                int loser = correction > 0.0f ? donor : receiver;
+                precise float gainerFill = fill[gainer] + fillLowDelta[gainer];
+                precise float loserFill = fill[loser] + fillLowDelta[loser];
+                float raise = min(1.0f, DivideRounded(max(1.0f - gainerFill, 0.0f), fillGains[gainer]));
+                float lower = min(1.0f, DivideRounded(max(loserFill, 0.0f), fillLosses[loser]));
+                precise float scaledCorrection = min(raise, lower) * correction;
+                amount = amount + scaledCorrection;
+            }
+        }
 
         // Negligible amounts don't start new cells
-        if (amount < minFillEpsilon && fill[receiver] <= minFillEpsilon && !(keepSurfaceFilm != 0 && IsLiquidCell(donor)))
+        if (amount >= 0.0f && amount < minFillEpsilon && fill[receiver] <= minFillEpsilon && !(keepSurfaceFilm != 0 && IsLiquidCell(donor)))
             continue;
 
         touched = true;
@@ -1663,9 +1861,19 @@ technique Tech0
         ComputeShader = compile cs_5_0 initSealedLabels();
     }
 
-    pass ResetSealedStatus
+    pass StartSealedLabels
     {
-        ComputeShader = compile cs_5_0 resetSealedStatus();
+        ComputeShader = compile cs_5_0 startSealedLabels();
+    }
+
+    pass FinishLabelRound
+    {
+        ComputeShader = compile cs_5_0 finishLabelRound();
+    }
+
+    pass ForceSettleSealedLabels
+    {
+        ComputeShader = compile cs_5_0 forceSettleSealedLabels();
     }
 
     pass PropagateSealedLabels
@@ -1736,6 +1944,11 @@ technique Tech0
     pass FillApply
     {
         ComputeShader = compile cs_5_0 fillApply();
+    }
+
+    pass FillCorrectionTotals
+    {
+        ComputeShader = compile cs_5_0 fillCorrectionTotals();
     }
 
     pass ApplySources
