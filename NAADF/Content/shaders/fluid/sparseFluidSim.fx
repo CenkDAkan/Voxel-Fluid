@@ -142,6 +142,8 @@ StructuredBuffer<float> fillLosses;      // sum of the corrections that would lo
 RWStructuredBuffer<float> fillLowDeltaRw;
 RWStructuredBuffer<float> fillGainsRw;
 RWStructuredBuffer<float> fillLossesRw;
+StructuredBuffer<uint> fillSurfaceAxes;  // per cell, bit a set when its surface faces axis a (fillSurfaceOrientation), held in sealedLabel
+RWStructuredBuffer<uint> fillSurfaceAxesRw;
 
 // Sources: eight ints per source cell (its index, the indices of its lower neighbors along x, y, z, then the velocity's three floats as bits)
 StructuredBuffer<int> sourceCells;
@@ -945,14 +947,18 @@ void applyA(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 
 // The sum of brickSum and the maximum of brickMax over all bricks, by one group of threads:
 // each takes every REDUCE_THREADS-th brick, then the results are folded in two rounds; only the first thread gets the totals
-void ReduceBricks(uint thread, out float sum, out float largest)
+// With skip set (the same for every thread) the bricks aren't read and the totals are zero
+void ReduceBricks(uint thread, bool skip, out float sum, out float largest)
 {
     float partSum = 0.0f;
     float partMax = 0.0f;
-    for (int slot = (int) thread; slot < slotCount; slot += REDUCE_THREADS)
+    if (!skip)
     {
-        partSum += brickSum[slot];
-        partMax = max(partMax, brickMax[slot]);
+        for (int slot = (int) thread; slot < slotCount; slot += REDUCE_THREADS)
+        {
+            partSum += brickSum[slot];
+            partMax = max(partMax, brickMax[slot]);
+        }
     }
     reduceSum[thread] = partSum;
     reduceMax[thread] = partMax;
@@ -997,7 +1003,7 @@ void FinishSolve()
 void finalizeStart(uint3 threadID : SV_GroupThreadID)
 {
     float sum, residual;
-    ReduceBricks(threadID.x, sum, residual);
+    ReduceBricks(threadID.x, false, sum, residual);
     if (threadID.x != 0)
         return;
 
@@ -1020,7 +1026,7 @@ void finalizeStart(uint3 threadID : SV_GroupThreadID)
 void finalizeAlpha(uint3 threadID : SV_GroupThreadID)
 {
     float sq, unused;
-    ReduceBricks(threadID.x, sq, unused);
+    ReduceBricks(threadID.x, scalars[SCALAR_DONE] != 0.0f, sq, unused);
     if (threadID.x != 0)
         return;
 
@@ -1076,7 +1082,7 @@ void updateSolution(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 void finalizeBeta(uint3 threadID : SV_GroupThreadID)
 {
     float rhoNew, residual;
-    ReduceBricks(threadID.x, rhoNew, residual);
+    ReduceBricks(threadID.x, scalars[SCALAR_DONE] != 0.0f, rhoNew, residual);
     if (threadID.x != 0 || scalars[SCALAR_DONE] != 0.0f)
         return;
 
@@ -1161,6 +1167,17 @@ bool IsSupportedAir(int index)
     return (below >= 0 && (cellStateRw[below] & STATE_LIQUID) != 0) || IsSolidCell(below);
 }
 
+// Whether a cell holds fluid that nothing holds up: tracked with fill, neither liquid, source nor supported air
+bool IsUnsupportedFluid(int index)
+{
+    if (index < 0)
+        return false;
+    uint state = cellStateRw[index];
+    if ((state & STATE_TRACKED) == 0 || (state & (STATE_LIQUID | STATE_SOURCE)) != 0 || fill[index] <= 0.0f)
+        return false;
+    return !IsSupportedAir(index);
+}
+
 // A face the pressure solve has made consistent: not against solid, and bordering a liquid or source cell
 bool IsSolvedFace(int lower, int axis)
 {
@@ -1173,7 +1190,8 @@ bool IsSolvedFace(int lower, int axis)
     return IsFluidCellRw(lower) || IsFluidCellRw(upper);
 }
 
-// Gives the unsolved faces of supported air cells the average of the solved faces around them
+// Gives the unsolved faces of supported air cells the average of the solved faces around them, except faces shared with
+// unsupported fluid, which keep that fluid's own velocity so it can still fall onto the supported cell
 [numthreads(8, 8, 8)]
 void extrapolateIntoSupportedAir(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 {
@@ -1188,6 +1206,8 @@ void extrapolateIntoSupportedAir(uint3 groupID : SV_GroupID, uint localIndex : S
         if (!ownSupported && !IsSupportedAir(upper))
             continue;
         if (ownSolid || IsSolidCell(upper) || IsSolvedFace(index, axis))
+            continue;
+        if (IsUnsupportedFluid(ownSupported ? upper : index))
             continue;
 
         precise float sum = 0.0f;
@@ -1329,20 +1349,31 @@ bool IsEmptyNeighbor(int index, int axis, int direction)
     return !IsSolidCell(neighbor);
 }
 
-// Whether the fill gradient around a cell is largest along the axis, i.e. its surface faces that axis
-bool SurfaceFacesAxis(int index, float ownFill, int axis)
+// The axes a cell's surface faces, one bit per axis: those along which the fill gradient is largest (and not zero)
+uint SurfaceAxes(int index, float ownFill)
 {
-    float along = 0.0f;
-    float largestOther = 0.0f;
+    float gradient[3];
     for (int a = 0; a < 3; a++)
     {
-        precise float gradient = abs(NeighborFillOrOwn(index, a, -1, ownFill) - NeighborFillOrOwn(index, a, 1, ownFill));
-        if (a == axis)
-            along = gradient;
-        else
-            largestOther = max(largestOther, gradient);
+        precise float g = abs(NeighborFillOrOwn(index, a, -1, ownFill) - NeighborFillOrOwn(index, a, 1, ownFill));
+        gradient[a] = g;
     }
-    return along > 0.0f && along >= largestOther;
+    uint axes = 0;
+    for (int axis = 0; axis < 3; axis++)
+    {
+        float largestOther = max(gradient[(axis + 1) % 3], gradient[(axis + 2) % 3]);
+        if (gradient[axis] > 0.0f && gradient[axis] >= largestOther)
+            axes |= 1u << axis;
+    }
+    return axes;
+}
+
+// With donor-acceptor fill: per cell, the axes its surface faces, so the fill transport kernels look them up instead of working them out per face
+[numthreads(8, 8, 8)]
+void fillSurfaceOrientation(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    fillSurfaceAxesRw[index] = SurfaceAxes(index, fill[index]);
 }
 
 // Same as SparseFluidSolver.DonorAcceptorAmount: Hirt and Nichols' flux of fill from donor to acceptor for a face moving volume (0, 1]
@@ -1351,7 +1382,7 @@ float DonorAcceptorAmount(int axis, int donor, float acceptorFill, float volume,
     float donorFill = fill[donor];
     bool acceptorEmpty = acceptorFill <= minFillEpsilon;
     bool upstreamEmpty = IsEmptyNeighbor(donor, axis, upstreamDirection);
-    bool useAcceptor = !(acceptorEmpty && upstreamEmpty) && (acceptorEmpty || upstreamEmpty || SurfaceFacesAxis(donor, donorFill, axis));
+    bool useAcceptor = !(acceptorEmpty && upstreamEmpty) && (acceptorEmpty || upstreamEmpty || ((fillSurfaceAxes[donor] >> axis) & 1u) != 0);
     float flowingFill = useAcceptor ? acceptorFill : donorFill;
     precise float extra = max((1.0f - flowingFill) * volume - (1.0f - donorFill), 0.0f);
     precise float amount = min(flowingFill * volume + extra, donorFill);
@@ -1949,6 +1980,11 @@ technique Tech0
     pass FillCorrectionTotals
     {
         ComputeShader = compile cs_5_0 fillCorrectionTotals();
+    }
+
+    pass FillSurfaceOrientation
+    {
+        ComputeShader = compile cs_5_0 fillSurfaceOrientation();
     }
 
     pass ApplySources

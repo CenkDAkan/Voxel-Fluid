@@ -730,8 +730,25 @@ namespace NAADF.World.Data
             return IsFluidCell(lowerIndex) || IsFluidCell(upperIndex);
         }
 
+        // Whether a cell is a below-threshold cell resting directly on liquid or solid
+        private bool IsSupportedAirCell(int index)
+        {
+            if (index < 0 || grid.tracked[index] == 0 || IsFluidCell(index) || grid.fill[index] <= 0f)
+                return false;
+            Point3 below = grid.CellPosition(index) - SparseFluidGrid.AxisOffsets[1];
+            int belowIndex = grid.NeighborIndex(index, 1, -1);
+            return (belowIndex >= 0 && (grid.flags[belowIndex] & FlagLiquid) != 0) || IsSolid(belowIndex, below);
+        }
+
+        // Whether a cell holds fluid that nothing holds up: tracked with fill, neither liquid, source nor supported air
+        private bool IsUnsupportedFluidCell(int index)
+        {
+            return index >= 0 && grid.tracked[index] != 0 && !IsFluidCell(index) && grid.fill[index] > 0f && !IsSupportedAirCell(index);
+        }
+
         // Below-threshold cells resting directly on liquid or solid take the velocity of the liquid around them on their free faces
-        // (zero when resting on solid alone), so gravity can't build up on them; unsupported cells keep their own ballistic velocity
+        // (zero when resting on solid alone), so gravity can't build up on them; unsupported cells keep their own ballistic velocity,
+        // also on the faces they share with a supported cell, so they can still fall onto it
         public void ExtrapolateIntoSupportedAir()
         {
             faceUpdates.Clear();
@@ -757,6 +774,8 @@ namespace NAADF.World.Data
                         int lowerIndex = side == 0 ? i : grid.NeighborIndex(i, axis, -1);
                         int upperIndex = side == 0 ? grid.NeighborIndex(i, axis, 1) : i;
                         if (IsSolid(lowerIndex, lower) || IsSolid(upperIndex, lower + offset) || IsValidFace(axis, lowerIndex, lower))
+                            continue;
+                        if (IsUnsupportedFluidCell(side == 0 ? upperIndex : lowerIndex))
                             continue;
 
                         float sum = 0f;

@@ -501,6 +501,8 @@ namespace NAADF.World.Data
             effect.Parameters["fillGainsRw"].SetValue(sBuffer);
             effect.Parameters["fillLosses"].SetValue(qBuffer);
             effect.Parameters["fillLossesRw"].SetValue(qBuffer);
+            effect.Parameters["fillSurfaceAxes"].SetValue(sealedLabelBuffer); // the sealed labels are only needed during Project
+            effect.Parameters["fillSurfaceAxesRw"].SetValue(sealedLabelBuffer);
             effect.Parameters["ledger"].SetValue(ledgerBuffer);
             effect.Parameters["brickLedger"].SetValue(brickLedgerBuffer);
             effect.Parameters["brickSummary"].SetValue(brickSummaryBuffer);
@@ -615,6 +617,8 @@ namespace NAADF.World.Data
             Stage(fillStatistics, Arrays.Faces, Arrays.Fill | Arrays.State, StateTracked | StateGained,
                 () =>
                 {
+                    if (solver.donorAcceptorFill)
+                        Dispatch("FillSurfaceOrientation", slots);
                     Dispatch("FillOutflow", slots);
                     Dispatch("FillInflow", slots);
                     if (solver.donorAcceptorFill)
