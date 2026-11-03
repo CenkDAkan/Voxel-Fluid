@@ -76,10 +76,13 @@ namespace NAADF.World.Data
         private readonly List<Mirror> mirrors = new List<Mirror>();
 
         private StructuredBuffer brickInfoBuffer, brickNeighborBuffer, solidBuffer;
+        // false until the layout or solid buffer holds every slot; after that, only the slots the grid reports as changed are uploaded
         private bool layoutCurrent = false, solidCurrent = false;
+        private readonly List<int> dirtySlots = new List<int>();
         private StructuredBuffer[] faceScratchBuffer = new StructuredBuffer[3];
         private StructuredBuffer diagBuffer, rBuffer, sBuffer, qBuffer;
         private StructuredBuffer brickSumBuffer, brickMaxBuffer, scalarsBuffer;
+        private StructuredBuffer sealedLabelBuffer, sealedStatusBuffer, sealedSumsBuffer;
         private StructuredBuffer fillOutTotalBuffer, fillOutScaledBuffer, fillInTotalBuffer, fillRawBuffer, fillStatusBuffer;
         private StructuredBuffer ledgerBuffer, brickLedgerBuffer, brickSummaryBuffer, visibleMaskBuffer;
         private StructuredBuffer sourceBuffer, previousSourceBuffer;
@@ -95,6 +98,7 @@ namespace NAADF.World.Data
         private readonly List<int> previousSourceCells = new List<int>();
         private int sourceCount;
         private readonly float[] scalarsReadback = new float[8];
+        private readonly uint[] sealedStatusReadback = new uint[4];
 
         // Same slots as the shader's ledger
         private const int LedgerInjected = 0, LedgerClampedAway = 1, LedgerClampCreated = 2, LedgerPrunedSolid = 3, LedgerPrunedEmpty = 4,
@@ -121,6 +125,11 @@ namespace NAADF.World.Data
         // The first batch is sized from what the previous tick needed, and further batches follow until the solve has converged
         private const int minPressureIterations = 16, maxPressureIterations = 300;
         private int pressureIterations = 32;
+
+        // Rounds of sealed-liquid label propagation are dispatched in batches the same way, until a round changes nothing
+        // Same as the shader's SEALED_MAX_GROUPS and its four sums per group
+        private const int minLabelRounds = 2, maxLabelRounds = 4096, sealedMaxGroups = 4096;
+        private int labelRounds = minLabelRounds;
 
         private const int logEveryTicks = 125;
         private readonly StageStatistics gravityStatistics = new StageStatistics { name = "Gravity", tolerance = 1e-6f };
@@ -154,10 +163,16 @@ namespace NAADF.World.Data
             return new StructuredBuffer(device, type, count, BufferUsage.None, ShaderAccess.ReadWrite);
         }
 
-        // Creates a buffer the kernels only read, filled from the CPU
+        // Creates a buffer the kernels only read, filled from the CPU as a whole every time (dynamic: each SetData discards the previous contents)
         private StructuredBuffer CreateUploadBuffer(Type type, int count)
         {
             return new StructuredBuffer(device, type, count, BufferUsage.None, ShaderAccess.Read, StructuredBufferType.Basic, -1, true);
+        }
+
+        // Creates a buffer the kernels only read, filled from the CPU in parts (SetData with an offset leaves the rest as it is)
+        private StructuredBuffer CreatePartialUploadBuffer(Type type, int count)
+        {
+            return new StructuredBuffer(device, type, count, BufferUsage.None, ShaderAccess.Read, StructuredBufferType.Basic, -1, false);
         }
 
         // Makes the buffers as large as the grid's arrays, what was only current on the GPU is brought back to the grid first
@@ -172,9 +187,9 @@ namespace NAADF.World.Data
             cellCapacity = gridCells;
             int slotCapacity = gridCells / SparseFluidGrid.BrickCells;
 
-            brickInfoBuffer = CreateUploadBuffer(typeof(int), slotCapacity * 4);
-            brickNeighborBuffer = CreateUploadBuffer(typeof(int), slotCapacity * 27);
-            solidBuffer = CreateUploadBuffer(typeof(uint), gridCells / 4);
+            brickInfoBuffer = CreatePartialUploadBuffer(typeof(int), slotCapacity * 4);
+            brickNeighborBuffer = CreatePartialUploadBuffer(typeof(int), slotCapacity * 27);
+            solidBuffer = CreatePartialUploadBuffer(typeof(uint), gridCells / 4);
             layoutCurrent = solidCurrent = false;
 
             for (int axis = 0; axis < 3; axis++)
@@ -201,6 +216,9 @@ namespace NAADF.World.Data
             brickSumBuffer = CreateBuffer(typeof(float), slotCapacity);
             brickMaxBuffer = CreateBuffer(typeof(float), slotCapacity);
             scalarsBuffer = CreateBuffer(typeof(float), scalarsReadback.Length);
+            sealedLabelBuffer = CreateBuffer(typeof(uint), gridCells);
+            sealedStatusBuffer = CreateBuffer(typeof(uint), sealedStatusReadback.Length);
+            sealedSumsBuffer = CreateBuffer(typeof(uint), sealedMaxGroups * 4);
             fillOutTotalBuffer = CreateBuffer(typeof(float), gridCells);
             fillOutScaledBuffer = CreateBuffer(typeof(float), gridCells);
             fillInTotalBuffer = CreateBuffer(typeof(float), gridCells);
@@ -338,28 +356,66 @@ namespace NAADF.World.Data
             if ((arrays & Arrays.State) != 0) state.WrittenOnGpu();
         }
 
-        // Brick layout, read by the kernels that look at neighboring cells
+        // Brick layout, read by the kernels that look at neighboring cells: all slots after new buffers or a release, otherwise the slots that changed
         private void LayoutToGpu()
         {
-            if (layoutCurrent)
+            grid.TakeLayoutDirtySlots(dirtySlots);
+            if (layoutCurrent && dirtySlots.Count == 0)
                 return;
 
             grid.FillBrickInfo(brickInfoUpload);
-            brickInfoBuffer.SetData(brickInfoUpload, 0, slots * 4);
-            brickNeighborBuffer.SetData(grid.NeighborTable, 0, slots * 27);
-            layoutCurrent = true;
+            if (!layoutCurrent)
+            {
+                brickInfoBuffer.SetData(brickInfoUpload, 0, slots * 4);
+                brickNeighborBuffer.SetData(grid.NeighborTable, 0, slots * 27);
+                layoutCurrent = true;
+                return;
+            }
+
+            ForEachRun(dirtySlots, (first, count) =>
+            {
+                brickInfoBuffer.SetData(first * 4 * sizeof(int), brickInfoUpload, first * 4, count * 4, 0);
+                brickNeighborBuffer.SetData(first * 27 * sizeof(int), grid.NeighborTable, first * 27, count * 27, 0);
+            });
         }
 
-        // Solid and drain lookups for every cell of every brick, one byte per cell uploaded four to an element
+        // Solid and drain lookups, one byte per cell uploaded four to an element: every slot after new buffers or a release,
+        // otherwise the slots whose cached state changed, after querying their unknown cells
         private void SolidToGpu()
         {
-            if (solidCurrent)
+            grid.TakeSolidDirtySlots(dirtySlots);
+            if (!solidCurrent)
+            {
+                solver.FillSolid();
+                Buffer.BlockCopy(grid.solid, 0, byteUpload, 0, cells);
+                solidBuffer.SetData(byteUpload, 0, cells / 4);
+                solidCurrent = true;
                 return;
+            }
 
-            solver.FillSolid();
-            Buffer.BlockCopy(grid.solid, 0, byteUpload, 0, cells);
-            solidBuffer.SetData(byteUpload, 0, cells / 4);
-            solidCurrent = true;
+            foreach (int slot in dirtySlots)
+                solver.FillSolidSlot(slot);
+            ForEachRun(dirtySlots, (first, count) =>
+            {
+                int firstCell = first * SparseFluidGrid.BrickCells, cellCount = count * SparseFluidGrid.BrickCells;
+                Buffer.BlockCopy(grid.solid, firstCell, byteUpload, firstCell, cellCount);
+                solidBuffer.SetData(firstCell, byteUpload, firstCell / 4, cellCount / 4, 0);
+            });
+        }
+
+        // Calls upload once per run of consecutive slots in a sorted list, with the run's first slot and length
+        // Slots past the current slot count are skipped
+        private void ForEachRun(List<int> sortedSlots, Action<int, int> upload)
+        {
+            int i = 0;
+            while (i < sortedSlots.Count && sortedSlots[i] < slots)
+            {
+                int first = sortedSlots[i], last = first;
+                while (i + 1 < sortedSlots.Count && sortedSlots[i + 1] == last + 1 && sortedSlots[i + 1] < slots)
+                    last = sortedSlots[++i];
+                upload(first, last - first + 1);
+                i++;
+            }
         }
 
         // Brings the grid's arrays up to date for code that reads them directly. Without velocities, face velocities and pressure are left where they are
@@ -421,6 +477,9 @@ namespace NAADF.World.Data
             effect.Parameters["brickSum"].SetValue(brickSumBuffer);
             effect.Parameters["brickMax"].SetValue(brickMaxBuffer);
             effect.Parameters["scalars"].SetValue(scalarsBuffer);
+            effect.Parameters["sealedLabel"].SetValue(sealedLabelBuffer);
+            effect.Parameters["sealedStatus"].SetValue(sealedStatusBuffer);
+            effect.Parameters["sealedSums"].SetValue(sealedSumsBuffer);
             effect.Parameters["fillOutTotal"].SetValue(fillOutTotalBuffer);
             effect.Parameters["fillOutScaled"].SetValue(fillOutScaledBuffer);
             effect.Parameters["fillInTotal"].SetValue(fillInTotalBuffer);
@@ -574,6 +633,7 @@ namespace NAADF.World.Data
             AddStageTime(0, start);
         }
 
+
         // Adds the time since start to a stage's total in the solver and returns the current timestamp
         private long AddStageTime(int stage, long start)
         {
@@ -588,7 +648,6 @@ namespace NAADF.World.Data
             EnsureCapacity();
             slots = grid.SlotCount;
             cells = slots * SparseFluidGrid.BrickCells;
-            layoutCurrent = solidCurrent = false;
 
             // Fewer slots than before only happens when the grid was cleared
             if (slots < gpuSlots)
@@ -681,9 +740,11 @@ namespace NAADF.World.Data
             }
         }
 
-        // Advects the face velocities into the scratch buffers, which then become the face buffers
+        // Extrapolates the face velocities into the air if the solver does, advects them into the scratch buffers, which then become the face buffers
         private void AdvectVelocityKernels()
         {
+            if (solver.extrapolateIntoAir)
+                Dispatch("ExtrapolateIntoAir", slots);
             for (int axis = 0; axis < 3; axis++)
                 effect.Parameters[FaceRwNames[axis]].SetValue(faceScratchBuffer[axis]);
             Dispatch("AdvectVelocity", slots);
@@ -760,8 +821,10 @@ namespace NAADF.World.Data
         private void ProjectKernels()
         {
             Dispatch("ClassifyLiquid", slots);
+            Dispatch("MarkLiquidNeighbors", slots);
             Dispatch("ZeroSolidFaces", slots);
             Dispatch("BuildSystem", slots);
+            int sealedCells = RemoveSealedMeans();
             Dispatch("FinalizeStart", 1);
 
             // The starting residual decides whether any iterations are needed at all
@@ -799,7 +862,39 @@ namespace NAADF.World.Data
             {
                 solver.lastPressureIterations = gpuIterations;
                 solver.lastPressureResidual = scalarsReadback[3];
+                solver.lastSealedCells = sealedCells;
             }
+        }
+
+        // Finds the groups of liquid cells with no air neighbor and takes each one's mean out of the starting residual, as
+        // SparseFluidSolver.RemoveSealedMeans does with b, returns the number of sealed liquid cells
+        private int RemoveSealedMeans()
+        {
+            Dispatch("InitSealedLabels", slots);
+            int rounds = 0;
+            bool changed = true;
+            while (changed && rounds < maxLabelRounds)
+            {
+                int batch = Math.Min(labelRounds, maxLabelRounds - rounds);
+                for (int round = 0; round < batch; round++)
+                {
+                    Dispatch("ResetSealedStatus", 1);
+                    Dispatch("PropagateSealedLabels", slots);
+                }
+                rounds += batch;
+                sealedStatusBuffer.GetData(sealedStatusReadback, 0, sealedStatusReadback.Length);
+                changed = sealedStatusReadback[0] != 0;
+            }
+            labelRounds = Math.Clamp(rounds, minLabelRounds, maxLabelRounds);
+
+            int sealedCells = (int)sealedStatusReadback[1];
+            if (sealedCells == 0)
+                return 0;
+
+            Dispatch("AssignSealedGroups", slots);
+            Dispatch("SumSealedResiduals", slots);
+            Dispatch("RemoveSealedMeans", slots);
+            return sealedCells;
         }
 
         // Adds the per-brick parts of a range of ledger slots to the tick's ledger
@@ -814,7 +909,7 @@ namespace NAADF.World.Data
         private void ReadTickSummary()
         {
             BindBuffers();
-            Dispatch("SummarizeBricks", (slots + 63) / 64);
+            Dispatch("SummarizeBricks", slots);
             brickSummaryBuffer.GetData(summaryReadback, 0, slots);
             ledgerBuffer.GetData(ledgerReadback, 0, LedgerSize);
 
@@ -892,6 +987,9 @@ namespace NAADF.World.Data
             brickSumBuffer?.Dispose();
             brickMaxBuffer?.Dispose();
             scalarsBuffer?.Dispose();
+            sealedLabelBuffer?.Dispose();
+            sealedStatusBuffer?.Dispose();
+            sealedSumsBuffer?.Dispose();
             fillOutTotalBuffer?.Dispose();
             fillOutScaledBuffer?.Dispose();
             fillInTotalBuffer?.Dispose();

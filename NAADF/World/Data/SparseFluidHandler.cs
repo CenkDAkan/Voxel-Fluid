@@ -95,6 +95,19 @@ namespace NAADF.World.Data
         public float sprinklerAngularSpeedDegPerSec = 90f;
         public float sprinklerTiltDegrees = 35f;
 
+        // Rain: cubic drops of rainDropSize cells, each held full for one tick at rainHeight above the ground, falling at rainDropSpeed,
+        // at random points of a square of half side rainHalfSize around the point that was aimed at when rain was switched on
+        public bool rainEnabled = false;
+        public float rainDropsPerSecond = 10f;
+        public int rainDropSize = 3;
+        public int rainHalfSize = 40;
+        public int rainHeight = 40;
+        public float rainDropSpeed = 10f;
+        private Point3 rainCenter;
+        private int rainGroundY;
+        private float rainDropBacklog = 0f;
+        private readonly Random rainRandom = new Random();
+
         // Creates the solver with this handler's solid and drain lookups, and registers the fluid and emitter voxel types
         public SparseFluidHandler(WorldData worldData)
         {
@@ -170,7 +183,7 @@ namespace NAADF.World.Data
             HandlePlaceInput();
             HandleEmitterInput();
 
-            if (solver.Count == 0 && emitters.Count == 0)
+            if (solver.Count == 0 && emitters.Count == 0 && !rainEnabled)
                 return;
 
             if (gpuEnabled && gpu == null)
@@ -181,7 +194,7 @@ namespace NAADF.World.Data
                 }
                 catch (Exception e)
                 {
-                    // The shader needs compute shaders with double precision support, without it the simulation stays on the CPU
+                    // Without compute shader support, or if the shader fails to load, the simulation stays on the CPU
                     Console.WriteLine($"SparseFluidHandler: GPU simulation unavailable, running on the CPU ({e.Message})");
                     gpuEnabled = false;
                 }
@@ -368,6 +381,43 @@ namespace NAADF.World.Data
             Log($"SparseFluidHandler: placed {kind} at ({position.X}, {position.Y}, {position.Z}).");
         }
 
+        // Switches rain on around the ground below the aim point, or off
+        public void SetRain(bool enabled)
+        {
+            rainEnabled = enabled;
+            rainDropBacklog = 0f;
+            if (!enabled)
+                return;
+
+            Vector3 camPos = WorldRender.camera.GetPos().toVector3();
+            Vector3 aimPoint = camPos + WorldRender.camera.GetDir() * 20f;
+            uint hitType = worldData.RayTraversal(aimPoint + new Vector3(0, 200, 0), new Vector3(0, -1, 0), out float hitLength, out Point3 hitVoxel, out Point3 hitNormal);
+            rainGroundY = hitType != 0 ? hitVoxel.Y + 1 : (int)aimPoint.Y - 40;
+            rainCenter = new Point3((int)aimPoint.X, rainGroundY, (int)aimPoint.Z);
+            ticksSinceSeed = 0;
+            loggedFirstContact = false;
+            ResetVolumeTracking();
+            Log($"SparseFluidHandler: rain over ({rainCenter.X}, {rainCenter.Z}) +-{rainHalfSize}, ground at y{rainGroundY}.");
+        }
+
+        // Adds this tick's raindrops to the sources: whole drops at the rate set, the fraction carried over to the next tick
+        private void AddRaindrops(List<SparseFluidSolver.Source> sources, float dt)
+        {
+            rainDropBacklog += rainDropsPerSecond * dt;
+            int size = Math.Max(1, rainDropSize);
+            int topY = Math.Min(rainGroundY + rainHeight, worldData.sizeInVoxels.Y - size - 2);
+            Vector3 velocity = new Vector3(0f, -rainDropSpeed, 0f);
+            while (rainDropBacklog >= 1f)
+            {
+                rainDropBacklog -= 1f;
+                Point3 corner = new Point3(rainCenter.X + rainRandom.Next(-rainHalfSize, rainHalfSize + 1), topY, rainCenter.Z + rainRandom.Next(-rainHalfSize, rainHalfSize + 1));
+                for (int x = 0; x < size; x++)
+                    for (int y = 0; y < size; y++)
+                        for (int z = 0; z < size; z++)
+                            sources.Add(new SparseFluidSolver.Source { cell = corner + new Point3(x, y, z), velocity = velocity });
+            }
+        }
+
         // Erases every emitter marker and stops all injection, leaving existing fluid in place
         public void RemoveAllEmitters()
         {
@@ -391,7 +441,7 @@ namespace NAADF.World.Data
             CommitEdits();
         }
 
-        // Advances each sprinkler's sweep and returns every nozzle cell with its emitter's launch velocity
+        // Advances each sprinkler's sweep and returns every nozzle cell with its emitter's launch velocity, plus this tick's raindrops
         private List<SparseFluidSolver.Source> BuildSources(float dt)
         {
             List<SparseFluidSolver.Source> sources = new List<SparseFluidSolver.Source>();
@@ -429,6 +479,8 @@ namespace NAADF.World.Data
                     for (int b = -nozzleRadius; b <= nozzleRadius; b++)
                         sources.Add(new SparseFluidSolver.Source { cell = center + axisA * a + axisB * b, velocity = launchVelocity });
             }
+            if (rainEnabled)
+                AddRaindrops(sources, dt);
             return sources;
         }
 
@@ -457,6 +509,7 @@ namespace NAADF.World.Data
             foreach (Emitter emitter in emitters)
                 WriteCell(emitter.position, false);
             emitters.Clear();
+            rainEnabled = false;
 
             CommitEdits();
 

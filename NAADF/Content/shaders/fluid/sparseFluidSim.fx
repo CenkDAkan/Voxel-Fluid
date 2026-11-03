@@ -17,6 +17,7 @@
 #define STATE_PRESENT 16      // face present, one bit per axis from here on
 #define STATE_PRESENT_ALL 112
 #define STATE_LOW_HALF 0xFFFF // everything but the stagnation counter in the upper half
+#define STATE_LIQUID_NEIGHBORS_SHIFT 7 // six bits set by markLiquidNeighbors for the pressure solve: bit axis * 2 for the + neighbor, axis * 2 + 1 for the -
 #define STATE_STAGNANT_SHIFT 16
 
 // Bits of a solid mask byte, same values as SparseFluidGrid.SolidBlocked / SolidDrain
@@ -44,6 +45,17 @@
 #define SCALAR_RESIDUAL 3
 #define SCALAR_DONE 4
 #define SCALAR_ITERATIONS 5
+
+// Sealed liquid labels: 0 = not liquid, LABEL_OPEN = connected to air, otherwise the lowest cell index of the group + 2;
+// once the labels have settled, the lowest cell's own label is LABEL_ROOT | its group number
+#define LABEL_OPEN 1
+#define LABEL_ROOT 0x80000000
+#define LABEL_STEPS 8 // propagation steps inside a brick per round
+#define SEALED_STATUS_CHANGED 0
+#define SEALED_STATUS_CELLS 1
+#define SEALED_STATUS_GROUPS 2
+#define SEALED_MAX_GROUPS 4096
+#define SEALED_FIXED_SCALE 65536.0
 
 // Outcome of fill transport for a cell, in fillStatus
 #define FILL_TOUCHED 1
@@ -101,6 +113,9 @@ RWStructuredBuffer<float> pcgQ;
 RWStructuredBuffer<float> brickSum; // per slot
 RWStructuredBuffer<float> brickMax; // per slot
 RWStructuredBuffer<float> scalars;
+RWStructuredBuffer<uint> sealedLabel;  // per cell, see LABEL_OPEN
+RWStructuredBuffer<uint> sealedStatus; // SEALED_STATUS_* counters
+RWStructuredBuffer<uint> sealedSums;   // four per group: low byte, second byte and the signed rest of the fixed-point residual sum, then the cell count
 
 // Fill transport: per-cell totals of the transfers out of and into a cell, then the result
 RWStructuredBuffer<float> fillOutTotal;  // outflow as the face velocities ask for it
@@ -121,9 +136,16 @@ RWStructuredBuffer<uint> visibleMask;   // one bit per cell, 32 cells per elemen
 
 groupshared float sharedA[BRICK_CELLS];
 groupshared float sharedB[BRICK_CELLS];
-groupshared uint sharedKind[BRICK_CELLS];
 groupshared float sliceA[8];
 groupshared float sliceB[8];
+groupshared uint sharedLabel[BRICK_CELLS];
+groupshared float4 sharedV[BRICK_CELLS];
+groupshared float4 sharedC[BRICK_CELLS];
+groupshared uint sharedBits;
+groupshared uint sharedTracked;
+groupshared uint sharedLiquid;
+groupshared uint sharedChanged;
+groupshared uint sharedSealed;
 
 #define REDUCE_THREADS 1024
 #define REDUCE_FOLD 32
@@ -197,6 +219,56 @@ int NeighborCell(int index, int axis, int direction)
     if (other < 0)
         return -1;
     return (other << CELL_SHIFT) | ((index & (BRICK_CELLS - 1)) - direction * (BRICK_MASK << shift));
+}
+
+// a / c rounded to the nearest float (ties to even), as an IEEE division and so the CPU version rounds it, a float division on the GPU
+// may be off by up to 2.5 units in the last place. Long division of the 24-bit significands with a round and a sticky bit
+// zero, subnormal, infinite and out-of-range values fall back to the plain division
+float DivideRounded(float a, float c)
+{
+    float result = a / c;
+    uint ua = asuint(a);
+    uint uc = asuint(c);
+    int ea = (int) ((ua >> 23) & 0xFF);
+    int ec = (int) ((uc >> 23) & 0xFF);
+    if (ea != 0 && ec != 0 && ea != 255 && ec != 255)
+    {
+        uint ma = (ua & 0x7FFFFFu) | 0x800000u;
+        uint mc = (uc & 0x7FFFFFu) | 0x800000u;
+        int e = ea - ec + 127;
+        if (ma < mc)
+        {
+            ma <<= 1;
+            e -= 1;
+        }
+
+        // q gets the leading 1, 23 more significand bits and the round bit, r is what remains
+        uint r = ma - mc;
+        uint q = 1;
+        [unroll]
+        for (int i = 0; i < 24; i++)
+        {
+            r <<= 1;
+            q <<= 1;
+            if (r >= mc)
+            {
+                r -= mc;
+                q |= 1;
+            }
+        }
+
+        uint m = q >> 1;
+        if ((q & 1) != 0 && (r != 0 || (m & 1) != 0))
+            m++;
+        if (m == 0x1000000u)
+        {
+            m = 0x800000u;
+            e++;
+        }
+        if (e > 0 && e < 255)
+            result = asfloat(((ua ^ uc) & 0x80000000u) | ((uint) e << 23) | (m & 0x7FFFFFu));
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -394,6 +466,41 @@ void WriteFaceRw(int axis, int index, float value)
         faceRwZ[index] = value;
 }
 
+// Velocity extrapolation into the air (Bridson), one layer deep, before advection: every face that isn't present and isn't against solid
+// takes the average of the present faces next to it along the same axis. Only faces that aren't present are written and only present
+// ones are read, so the order the threads run in doesn't matter, advection sets these faces back to zero
+[numthreads(8, 8, 8)]
+void extrapolateIntoAir(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int slot = (int) groupID.x;
+    if (brickInfo[slot * 4 + 3] == 0)
+        return;
+
+    int index = (slot << CELL_SHIFT) | (int) localIndex;
+    uint state = cellStateRw[index];
+    for (int axis = 0; axis < 3; axis++)
+    {
+        uint presentBit = STATE_PRESENT << axis;
+        if ((state & presentBit) != 0)
+            continue;
+
+        precise float sum = 0.0f;
+        int count = 0;
+        for (int d = 0; d < 6; d++)
+        {
+            int neighbor = NeighborCell(index, d >> 1, (d & 1) == 0 ? 1 : -1);
+            if (neighbor >= 0 && (cellStateRw[neighbor] & presentBit) != 0)
+            {
+                sum += ReadFaceRw(axis, neighbor);
+                count++;
+            }
+        }
+        if (count == 0 || IsSolidCell(index) || IsSolidCell(NeighborCell(index, axis, 1)))
+            continue;
+        WriteFaceRw(axis, index, DivideRounded(sum, (float) count));
+    }
+}
+
 // How a liquid cell sees one of its neighbors: 0 = liquid, 1 = air, 2 = solid or source (no flow through the face)
 int NeighborKind(int neighbor)
 {
@@ -466,6 +573,47 @@ void ReduceBrick(uint localIndex, out float sum, out float largest)
     }
 }
 
+// The sums of sharedA and sharedB over a brick, halving the range each step, once every thread of the group has written its entry, every thread gets the totals
+void SumBrickPair(uint localIndex, out float sumA, out float sumB)
+{
+    for (uint stride = BRICK_CELLS / 2; stride > 0; stride >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (localIndex < stride)
+        {
+            sharedA[localIndex] += sharedA[localIndex + stride];
+            sharedB[localIndex] += sharedB[localIndex + stride];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    sumA = sharedA[0];
+    sumB = sharedB[0];
+}
+
+// Per liquid cell, which of its six neighbors are liquid cells too, in the state word's STATE_LIQUID_NEIGHBORS bits
+// (a liquid cell is never solid or a source, so these are the neighbors NeighborKind calls liquid). Only those bits change, 
+// so reading a neighbor's word while it is written is safe
+[numthreads(8, 8, 8)]
+void markLiquidNeighbors(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    uint state = cellStateRw[index];
+    uint mask = 0;
+    if ((state & STATE_LIQUID) != 0)
+    {
+        for (int axis = 0; axis < 3; axis++)
+        {
+            int upper = NeighborCell(index, axis, 1);
+            int lower = NeighborCell(index, axis, -1);
+            if (upper >= 0 && (cellStateRw[upper] & STATE_LIQUID) != 0)
+                mask |= 1u << (axis * 2);
+            if (lower >= 0 && (cellStateRw[lower] & STATE_LIQUID) != 0)
+                mask |= 1u << (axis * 2 + 1);
+        }
+    }
+    cellStateRw[index] = (state & ~(63u << STATE_LIQUID_NEIGHBORS_SHIFT)) | (mask << STATE_LIQUID_NEIGHBORS_SHIFT);
+}
+
 // Diagonal and right-hand side per liquid cell, then the starting residual r = b - A p and search direction s = r / diag
 // Also leaves, per brick, the sum of r * (r / diag) and the largest |r|; reads the faces through their read-only names to stay within eight writable buffers
 [numthreads(8, 8, 8)]
@@ -530,25 +678,202 @@ void buildSystem(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
     }
 }
 
-// q = A s, and per brick the sum of s * q
+// ---------------------------------------------------------------------------------------------------------
+// Sealed liquid (Bridson): a connected group of liquid cells with no air neighbor has its pressure fixed only up to a constant,
+// and A p = b only has a solution when b sums to zero over the group, so the group's mean is taken out of the starting residual
+// A's columns sum to zero over such a group, so the residual r = b - A p sums to the same as b
+
+// Liquid cells next to air (or with no liquid neighbor) start out open, the others with their own index; liquid neighbors then share the lowest label
+[numthreads(8, 8, 8)]
+void initSealedLabels(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    uint label = 0;
+    if (IsLiquidCell(index))
+    {
+        // A cell with no liquid neighbor is a group of its own whose diagonal is forced to 1, so it is not singular either
+        bool anyAir = false, anyLiquid = false;
+        for (int axis = 0; axis < 3; axis++)
+        {
+            int upperKind = NeighborKind(NeighborCell(index, axis, 1));
+            int lowerKind = NeighborKind(NeighborCell(index, axis, -1));
+            anyAir = anyAir || upperKind == 1 || lowerKind == 1;
+            anyLiquid = anyLiquid || upperKind == 0 || lowerKind == 0;
+        }
+        label = anyAir || !anyLiquid ? LABEL_OPEN : (uint) index + 2;
+    }
+    sealedLabel[index] = label;
+}
+
+// Clears the counters of one propagation round
+[numthreads(1, 1, 1)]
+void resetSealedStatus()
+{
+    sealedStatus[SEALED_STATUS_CHANGED] = 0;
+    sealedStatus[SEALED_STATUS_CELLS] = 0;
+    sealedStatus[SEALED_STATUS_GROUPS] = 0;
+}
+
+// One round: each liquid cell takes the lowest label of its liquid neighbors in other bricks once, then of those in its own brick
+// for LABEL_STEPS steps. Counts whether any label changed and how many liquid cells are still sealed, labels only ever decrease,
+// so a round in which nothing changed means every group carries its lowest label, or LABEL_OPEN if any of its cells touches air
+[numthreads(8, 8, 8)]
+void propagateSealedLabels(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int slot = (int) groupID.x;
+    int index = (slot << CELL_SHIFT) | (int) localIndex;
+    uint own = sealedLabel[index];
+    uint best = own;
+    uint inBrick = 0; // bit d set when neighbor d (axis d / 2, + for even d) is a liquid cell of this brick
+    if (localIndex == 0)
+    {
+        sharedChanged = 0;
+        sharedSealed = 0;
+    }
+
+    if (own > LABEL_OPEN)
+    {
+        uint liquidNeighbors = cellState[index] >> STATE_LIQUID_NEIGHBORS_SHIFT;
+        for (int d = 0; d < 6; d++)
+        {
+            if ((liquidNeighbors & (1u << d)) == 0)
+                continue;
+            int neighbor = NeighborCell(index, d >> 1, (d & 1) == 0 ? 1 : -1);
+            if ((neighbor >> CELL_SHIFT) == slot)
+                inBrick |= 1u << d;
+            else
+                best = min(best, sealedLabel[neighbor]);
+        }
+    }
+
+    sharedLabel[localIndex] = best;
+    for (int step = 0; step < LABEL_STEPS; step++)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        uint next = best;
+        for (int d = 0; d < 6; d++)
+        {
+            if ((inBrick & (1u << d)) != 0)
+                next = min(next, sharedLabel[(int) localIndex + ((d & 1) == 0 ? 1 : -1) * (1 << (BRICK_SHIFT * (d >> 1)))]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        best = next;
+        sharedLabel[localIndex] = best;
+    }
+
+    if (best < own)
+    {
+        sealedLabel[index] = best;
+        sharedChanged = 1;
+    }
+    if (best > LABEL_OPEN)
+        InterlockedAdd(sharedSealed, 1);
+    GroupMemoryBarrierWithGroupSync();
+    if (localIndex == 0)
+    {
+        if (sharedChanged != 0)
+            sealedStatus[SEALED_STATUS_CHANGED] = 1;
+        if (sharedSealed != 0)
+            InterlockedAdd(sealedStatus[SEALED_STATUS_CELLS], sharedSealed);
+    }
+}
+
+// The group number of a sealed cell, from its own label or its group's lowest cell. SEALED_MAX_GROUPS or more when it has none
+uint SealedGroup(uint label)
+{
+    return (label & LABEL_ROOT) != 0 ? (label & ~LABEL_ROOT) : (sealedLabel[label - 2] & ~LABEL_ROOT);
+}
+
+// Once the labels have settled: the lowest cell of each sealed group numbers its group and clears the group's sums
+[numthreads(8, 8, 8)]
+void assignSealedGroups(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    if (sealedLabel[index] != (uint) index + 2)
+        return;
+
+    uint group;
+    InterlockedAdd(sealedStatus[SEALED_STATUS_GROUPS], 1, group);
+    sealedLabel[index] = LABEL_ROOT | group;
+    if (group < SEALED_MAX_GROUPS)
+    {
+        for (int k = 0; k < 4; k++)
+            sealedSums[group * 4 + k] = 0;
+    }
+}
+
+// Adds each sealed cell's residual to its group's sum, in fixed point so the sum doesn't depend on the order of the additions
+[numthreads(8, 8, 8)]
+void sumSealedResiduals(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int index = ((int) groupID.x << CELL_SHIFT) | (int) localIndex;
+    uint label = sealedLabel[index];
+    if (label <= LABEL_OPEN)
+        return;
+    uint group = SealedGroup(label);
+    if (group >= SEALED_MAX_GROUPS)
+        return;
+
+    int fixedPoint = (int) round(clamp(pcgR[index], -30000.0f, 30000.0f) * SEALED_FIXED_SCALE);
+    InterlockedAdd(sealedSums[group * 4], (uint) (fixedPoint & 0xFF));
+    InterlockedAdd(sealedSums[group * 4 + 1], (uint) ((fixedPoint >> 8) & 0xFF));
+    InterlockedAdd(sealedSums[group * 4 + 2], (uint) (fixedPoint >> 16));
+    InterlockedAdd(sealedSums[group * 4 + 3], 1);
+}
+
+// Takes each sealed group's mean out of the residual of its cells, sets s = r / diag again, and redoes the per-brick sums as buildSystem leaves them
+[numthreads(8, 8, 8)]
+void removeSealedMeans(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    int slot = (int) groupID.x;
+    int index = (slot << CELL_SHIFT) | (int) localIndex;
+    float diag = pcgDiag[index];
+    float r = pcgR[index];
+    uint label = sealedLabel[index];
+    if (label > LABEL_OPEN)
+    {
+        uint group = SealedGroup(label);
+        if (group < SEALED_MAX_GROUPS)
+        {
+            // The fixed-point sum is exact; its float conversion and the mean are good to about 1e-7 relative, far inside the solver's tolerance
+            float count = (float) sealedSums[group * 4 + 3];
+            float mean = (float) asint(sealedSums[group * 4 + 2]) / count + ((float) sealedSums[group * 4 + 1] * 256.0f + (float) sealedSums[group * 4]) / (SEALED_FIXED_SCALE * count);
+            r -= mean;
+            pcgR[index] = r;
+            pcgS[index] = r / diag;
+        }
+    }
+
+    sharedA[localIndex] = diag > 0.0f ? r * r / diag : 0.0f;
+    sharedB[localIndex] = abs(r);
+    float sum, largest;
+    ReduceBrick(localIndex, sum, largest);
+    if (localIndex == 0)
+    {
+        brickSum[slot] = sum;
+        brickMax[slot] = largest;
+    }
+}
+
+// q = A s, and per brick the sum of s * q; the liquid neighbors come from markLiquidNeighbors
 [numthreads(8, 8, 8)]
 void applyA(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 {
     int slot = (int) groupID.x;
     int index = (slot << CELL_SHIFT) | (int) localIndex;
     float product = 0.0f;
-    if (scalars[SCALAR_DONE] == 0.0f && IsLiquidCell(index))
+    uint state = cellState[index];
+    if (scalars[SCALAR_DONE] == 0.0f && (state & STATE_LIQUID) != 0)
     {
+        uint liquidNeighbors = state >> STATE_LIQUID_NEIGHBORS_SHIFT;
         float ownS = pcgS[index];
         float sum = pcgDiag[index] * ownS;
         for (int axis = 0; axis < 3; axis++)
         {
-            int upper = NeighborCell(index, axis, 1);
-            int lower = NeighborCell(index, axis, -1);
-            if (NeighborKind(upper) == 0)
-                sum -= pcgS[upper];
-            if (NeighborKind(lower) == 0)
-                sum -= pcgS[lower];
+            if ((liquidNeighbors & (1u << (axis * 2))) != 0)
+                sum -= pcgS[NeighborCell(index, axis, 1)];
+            if ((liquidNeighbors & (2u << (axis * 2))) != 0)
+                sum -= pcgS[NeighborCell(index, axis, -1)];
         }
         pcgQ[index] = sum;
         product = ownS * sum;
@@ -807,8 +1132,7 @@ void extrapolateIntoSupportedAir(uint3 groupID : SV_GroupID, uint localIndex : S
             }
         }
 
-        // Divided in double so the result rounds like the CPU version
-        WriteFaceRw(axis, index, count > 0 ? (float) ((double) sum / (double) count) : 0.0f);
+        WriteFaceRw(axis, index, count > 0 ? DivideRounded(sum, (float) count) : 0.0f);
         present |= STATE_PRESENT << axis;
     }
 
@@ -888,11 +1212,11 @@ float FaceTransfer(int lower, int upper, int axis)
     return amount;
 }
 
-// a * b / c rounded like the CPU version, the division goes through double because a float division on the GPU may be off by one unit in the last place
+// a * b / c rounded like the CPU version
 float ScaleExact(float a, float b, float c)
 {
     precise float product = a * b;
-    return (float) ((double) product / (double) c);
+    return DivideRounded(product, c);
 }
 
 // A transfer once its donor's total outflow has been limited to what the donor holds
@@ -900,11 +1224,10 @@ float DonorLimited(float amount, int donor)
 {
     float total = fillOutTotal[donor];
     float available = fill[donor];
+    float limited = amount;
     if (total > available)
-    {
-        return ScaleExact(amount, available, total);
-    }
-    return amount;
+        limited = ScaleExact(amount, available, total);
+    return limited;
 }
 
 // Per cell: total outflow as the faces ask for it, and the outflow once limited to what the cell holds
@@ -1033,16 +1356,10 @@ void finishFill(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 
     sharedA[localIndex] = clampedAway;
     sharedB[localIndex] = clampCreated;
-    GroupMemoryBarrierWithGroupSync();
+    float sumAway, sumCreated;
+    SumBrickPair(localIndex, sumAway, sumCreated);
     if (localIndex == 0)
     {
-        float sumAway = 0.0f;
-        float sumCreated = 0.0f;
-        for (int local = 0; local < BRICK_CELLS; local++)
-        {
-            sumAway += sharedA[local];
-            sumCreated += sharedB[local];
-        }
         brickLedger[slot * LEDGER_SIZE + LEDGER_CLAMPED_AWAY] = sumAway;
         brickLedger[slot * LEDGER_SIZE + LEDGER_CLAMP_CREATED] = sumCreated;
     }
@@ -1197,22 +1514,24 @@ void pruneStaleCells(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex
         cellStateRw[index] = state;
     }
 
-    sharedA[localIndex] = volume;
-    sharedKind[localIndex] = kind;
+    // x = solid, y = empty, z = stagnant, w = drained, summed over the brick by halving the range each step
+    float4 select = float4(kind == LEDGER_PRUNED_SOLID, kind == LEDGER_PRUNED_EMPTY, kind == LEDGER_PRUNED_STAGNANT, kind == LEDGER_DRAINED);
+    sharedV[localIndex] = (select + float4(0.0f, 0.0f, kind == KIND_EVAPORATED, 0.0f)) * volume;
+    sharedC[localIndex] = select;
+    for (uint stride = BRICK_CELLS / 2; stride > 0; stride >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (localIndex < stride)
+        {
+            sharedV[localIndex] += sharedV[localIndex + stride];
+            sharedC[localIndex] += sharedC[localIndex + stride];
+        }
+    }
     GroupMemoryBarrierWithGroupSync();
     if (localIndex == 0)
     {
-        // x = solid, y = empty, z = stagnant, w = drained
-        float4 volumes = 0.0f;
-        float4 counts = 0.0f;
-        for (int local = 0; local < BRICK_CELLS; local++)
-        {
-            uint localKind = sharedKind[local];
-            float4 select = float4(localKind == LEDGER_PRUNED_SOLID, localKind == LEDGER_PRUNED_EMPTY, localKind == LEDGER_PRUNED_STAGNANT, localKind == LEDGER_DRAINED);
-            volumes += (select + float4(0.0f, 0.0f, localKind == KIND_EVAPORATED, 0.0f)) * sharedA[local];
-            counts += select;
-        }
-
+        float4 volumes = sharedV[0];
+        float4 counts = sharedC[0];
         int start = slot * LEDGER_SIZE;
         brickLedger[start + LEDGER_PRUNED_SOLID] = volumes.x;
         brickLedger[start + LEDGER_PRUNED_EMPTY] = volumes.y;
@@ -1227,48 +1546,62 @@ void pruneStaleCells(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex
 // ---------------------------------------------------------------------------------------------------------
 // Bookkeeping
 
-// Adds the per-brick parts of a range of ledger slots to the ledger
-[numthreads(1, 1, 1)]
-void sumBrickLedger()
+// Adds the per-brick parts of a range of ledger slots to the ledger, by one group of threads:
+// each takes every REDUCE_THREADS-th brick, then the parts are summed by halving the range each step
+[numthreads(REDUCE_THREADS, 1, 1)]
+void sumBrickLedger(uint3 threadID : SV_GroupThreadID)
 {
+    uint thread = threadID.x;
     for (int k = ledgerFirst; k < ledgerFirst + ledgerCount; k++)
     {
-        float sum = 0.0f;
-        for (int slot = 0; slot < slotCount; slot++)
-            sum += brickLedger[slot * LEDGER_SIZE + k];
-        ledger[k] += sum;
+        float part = 0.0f;
+        for (int slot = (int) thread; slot < slotCount; slot += REDUCE_THREADS)
+            part += brickLedger[slot * LEDGER_SIZE + k];
+        reduceSum[thread] = part;
+        for (uint stride = REDUCE_THREADS / 2; stride > 0; stride >>= 1)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            if (thread < stride)
+                reduceSum[thread] += reduceSum[thread + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (thread == 0)
+            ledger[k] += reduceSum[0];
+        GroupMemoryBarrierWithGroupSync();
     }
 }
 
-// Per brick: along which faces tracked cells lie, whether any face is present, and how many cells are tracked and liquid
-[numthreads(64, 1, 1)]
-void summarizeBricks(uint3 globalID : SV_DispatchThreadID)
+// Per brick, one group of threads: along which faces tracked cells lie, whether any face is present, and how many cells are tracked and liquid
+[numthreads(8, 8, 8)]
+void summarizeBricks(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 {
-    int slot = (int) globalID.x;
-    if (slot >= slotCount)
-        return;
-
-    int start = slot << CELL_SHIFT;
-    uint bits = 0;
-    uint trackedCells = 0;
-    uint liquidCells = 0;
-    for (int local = 0; local < BRICK_CELLS; local++)
+    int slot = (int) groupID.x;
+    if (localIndex == 0)
     {
-        uint state = cellState[start + local];
-        if ((state & STATE_PRESENT_ALL) != 0)
-            bits |= 64;
-        if ((state & STATE_LIQUID) != 0)
-            liquidCells++;
-        if ((state & STATE_TRACKED) == 0)
-            continue;
+        sharedBits = 0;
+        sharedTracked = 0;
+        sharedLiquid = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
 
-        trackedCells++;
-        int x = local & BRICK_MASK;
-        int y = (local >> BRICK_SHIFT) & BRICK_MASK;
-        int z = local >> (BRICK_SHIFT * 2);
+    uint state = cellState[(slot << CELL_SHIFT) | (int) localIndex];
+    uint bits = (state & STATE_PRESENT_ALL) != 0 ? 64 : 0;
+    if ((state & STATE_LIQUID) != 0)
+        InterlockedAdd(sharedLiquid, 1);
+    if ((state & STATE_TRACKED) != 0)
+    {
+        InterlockedAdd(sharedTracked, 1);
+        int x = (int) localIndex & BRICK_MASK;
+        int y = ((int) localIndex >> BRICK_SHIFT) & BRICK_MASK;
+        int z = (int) localIndex >> (BRICK_SHIFT * 2);
         bits |= (x == 0 ? 1 : 0) | (x == BRICK_MASK ? 2 : 0) | (y == 0 ? 4 : 0) | (y == BRICK_MASK ? 8 : 0) | (z == 0 ? 16 : 0) | (z == BRICK_MASK ? 32 : 0);
     }
-    brickSummary[slot] = bits | (trackedCells << 8) | (liquidCells << 18);
+    if (bits != 0)
+        InterlockedOr(sharedBits, bits);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (localIndex == 0)
+        brickSummary[slot] = sharedBits | (sharedTracked << 8) | (sharedLiquid << 18);
 }
 
 // One thread per 32 cells
@@ -1300,6 +1633,11 @@ technique Tech0
     {
         ComputeShader = compile cs_5_0 dampAndClampVelocity();
     }
+    pass ExtrapolateIntoAir
+    {
+        ComputeShader = compile cs_5_0 extrapolateIntoAir();
+    }
+
     pass AdvectVelocity
     {
         ComputeShader = compile cs_5_0 advectVelocity();
@@ -1310,9 +1648,44 @@ technique Tech0
         ComputeShader = compile cs_5_0 zeroSolidFaces();
     }
 
+    pass MarkLiquidNeighbors
+    {
+        ComputeShader = compile cs_5_0 markLiquidNeighbors();
+    }
+
     pass BuildSystem
     {
         ComputeShader = compile cs_5_0 buildSystem();
+    }
+
+    pass InitSealedLabels
+    {
+        ComputeShader = compile cs_5_0 initSealedLabels();
+    }
+
+    pass ResetSealedStatus
+    {
+        ComputeShader = compile cs_5_0 resetSealedStatus();
+    }
+
+    pass PropagateSealedLabels
+    {
+        ComputeShader = compile cs_5_0 propagateSealedLabels();
+    }
+
+    pass AssignSealedGroups
+    {
+        ComputeShader = compile cs_5_0 assignSealedGroups();
+    }
+
+    pass SumSealedResiduals
+    {
+        ComputeShader = compile cs_5_0 sumSealedResiduals();
+    }
+
+    pass RemoveSealedMeans
+    {
+        ComputeShader = compile cs_5_0 removeSealedMeans();
     }
 
     pass ApplyA

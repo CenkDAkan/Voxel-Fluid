@@ -203,6 +203,20 @@ namespace NAADF
                     App.worldHandler.worldData.sparseFluidHandler.RemoveAllEmitters();
 
                 ImGui.Separator();
+                SparseFluidHandler rainHandler = App.worldHandler.worldData.sparseFluidHandler;
+                bool rain = rainHandler.rainEnabled;
+                if (ImGui.Checkbox("Rain", ref rain))
+                    rainHandler.SetRain(rain);
+                ImGuiCommon.HelperIcon("Rains over a square around the ground below the point you aim at when ticking this (20 voxels in front of the camera). Untick and tick again to move it.", 500);
+                ImGui.SliderFloat("Drops per second", ref rainHandler.rainDropsPerSecond, 0.5f, 120f, "%.1f");
+                ImGui.SliderInt("Drop size", ref rainHandler.rainDropSize, 1, 4);
+                ImGuiCommon.HelperIcon("Side length of each cubic drop in voxels. Drops smaller than 3 smear out below the drawing threshold within a few ticks and fall unseen.", 500);
+                ImGui.SliderInt("Rain area half size", ref rainHandler.rainHalfSize, 4, 128);
+                ImGui.SliderInt("Rain height", ref rainHandler.rainHeight, 5, 120);
+                ImGuiCommon.HelperIcon("Drops appear this many voxels above the ground found when rain was switched on.", 500);
+                ImGui.SliderFloat("Drop speed", ref rainHandler.rainDropSpeed, 0f, 30f, "%.1f");
+
+                ImGui.Separator();
                 ImGui.SliderInt("Basin fill depth", ref basinFillDepth, 1, NAADF.World.WorldHandler.basinWallHeight);
                 ImGui.SameLine();
                 if (ImGui.Button("Fill basin"))
@@ -249,6 +263,9 @@ namespace NAADF
             ImGui.Checkbox("Gradual evaporation", ref handler.solver.gradualEvaporation);
             ImGui.SliderFloat("Evaporation per second", ref handler.solver.evaporationPerSecond, 0.005f, 0.5f, "%.3f");
             ImGuiCommon.HelperIcon("On: a stagnant dim cell loses this much fill per second until it is nearly empty. Off: it is removed all at once.", 500);
+
+            ImGui.Checkbox("Extrapolate velocity into air", ref handler.solver.extrapolateIntoAir);
+            ImGuiCommon.HelperIcon("Before velocity advection, faces next to the fluid that hold no velocity take the average of their neighbours (Bridson). Lets falling water keep its speed and shape; off, falling water caps at about 12 voxels/s and smears into mist.", 500);
 
             ImGui.SliderFloat("Thin water flow", ref handler.solver.thinWaterFlowPerSecond, 0f, 10f, "%.1f");
             ImGuiCommon.HelperIcon("How fast dim water resting on solid ground flows towards neighbours holding less and over edges, as the fraction per second of the fill difference. 0 turns it off; the water then stays where it landed.", 500);

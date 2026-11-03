@@ -69,6 +69,10 @@ namespace NAADF.World.Data
 
         private readonly Dictionary<long, int> brickMap = new Dictionary<long, int>();
         private readonly Stack<int> freeSlots = new Stack<int>();
+
+        // Brick slots whose layout (position, allocation, neighbor row) or cached solid state changed since an uploader last took them
+        private bool[] layoutDirty, solidDirty;
+        private readonly List<int> layoutDirtySlots = new List<int>(), solidDirtySlots = new List<int>();
         private int slotCapacity = 0;
 
         public int SlotCount { get; private set; }
@@ -113,6 +117,8 @@ namespace NAADF.World.Data
             Array.Resize(ref brickFacesPresent, newCapacity);
             Array.Resize(ref brickNeeded, newCapacity);
             Array.Resize(ref neighbor, newCapacity * NeighborCount);
+            Array.Resize(ref layoutDirty, newCapacity);
+            Array.Resize(ref solidDirty, newCapacity);
             slotCapacity = newCapacity;
         }
 
@@ -153,8 +159,48 @@ namespace NAADF.World.Data
             }
             brickMap.Clear();
             freeSlots.Clear();
+            foreach (int slot in layoutDirtySlots)
+                layoutDirty[slot] = false;
+            foreach (int slot in solidDirtySlots)
+                solidDirty[slot] = false;
+            layoutDirtySlots.Clear();
+            solidDirtySlots.Clear();
             SlotCount = 0;
             Count = 0;
+        }
+
+        // Notes that a slot's layout changed
+        private void MarkLayoutDirty(int slot)
+        {
+            if (slot < 0 || layoutDirty[slot])
+                return;
+            layoutDirty[slot] = true;
+            layoutDirtySlots.Add(slot);
+        }
+
+        // Notes that a slot's cached solid state changed
+        public void MarkSolidDirty(int slot)
+        {
+            if (solidDirty[slot])
+                return;
+            solidDirty[slot] = true;
+            solidDirtySlots.Add(slot);
+        }
+
+        // Hands over the slots whose layout changed since the last call, in increasing order, and forgets them
+        public void TakeLayoutDirtySlots(List<int> target) => TakeDirty(layoutDirtySlots, layoutDirty, target);
+
+        // Hands over the slots whose cached solid state changed since the last call, in increasing order, and forgets them
+        public void TakeSolidDirtySlots(List<int> target) => TakeDirty(solidDirtySlots, solidDirty, target);
+
+        private static void TakeDirty(List<int> dirtySlots, bool[] dirty, List<int> target)
+        {
+            target.Clear();
+            target.AddRange(dirtySlots);
+            foreach (int slot in dirtySlots)
+                dirty[slot] = false;
+            dirtySlots.Clear();
+            target.Sort();
         }
 
         // ---- Keys (world voxel position packed into a long, 21 bits per axis) ----
@@ -191,7 +237,10 @@ namespace NAADF.World.Data
                     {
                         int slot = FindBrick(bx, by, bz);
                         if (slot >= 0)
+                        {
                             Array.Clear(solid, slot << CellShift, BrickCells);
+                            MarkSolidDirty(slot);
+                        }
                     }
         }
 
@@ -252,6 +301,8 @@ namespace NAADF.World.Data
             brickTracked[slot] = 0;
             brickBorder[slot] = 0;
             brickFacesPresent[slot] = 0;
+            MarkLayoutDirty(slot);
+            MarkSolidDirty(slot);
 
             for (int dz = -1; dz <= 1; dz++)
                 for (int dy = -1; dy <= 1; dy++)
@@ -261,7 +312,10 @@ namespace NAADF.World.Data
                         int other = direction == 0 ? slot : FindBrick(bx + dx, by + dy, bz + dz);
                         neighbor[slot * NeighborCount + NeighborSelf + direction] = other;
                         if (other >= 0)
+                        {
                             neighbor[other * NeighborCount + NeighborSelf - direction] = slot;
+                            MarkLayoutDirty(other);
+                        }
                     }
             return slot;
         }
@@ -273,7 +327,10 @@ namespace NAADF.World.Data
             {
                 int other = neighbor[slot * NeighborCount + NeighborSelf + direction];
                 if (other >= 0 && other != slot)
+                {
                     neighbor[other * NeighborCount + NeighborSelf - direction] = -1;
+                    MarkLayoutDirty(other);
+                }
                 neighbor[slot * NeighborCount + NeighborSelf + direction] = -1;
             }
 
@@ -284,6 +341,8 @@ namespace NAADF.World.Data
             brickTracked[slot] = 0;
             brickBorder[slot] = 0;
             brickFacesPresent[slot] = 0;
+            MarkLayoutDirty(slot);
+            MarkSolidDirty(slot);
             freeSlots.Push(slot);
         }
 

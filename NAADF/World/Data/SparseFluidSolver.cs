@@ -58,6 +58,7 @@ namespace NAADF.World.Data
         private float[] airWeight = new float[0];
         private float[] diag = new float[0];
         private double[] b = new double[0], x = new double[0], r = new double[0], z = new double[0], s = new double[0], q = new double[0];
+        private int[] component = new int[0], componentQueue = new int[0];
 
         public const float visibilityThreshold = 0.5f;
         public const float liquidThreshold = 0.5f;
@@ -92,6 +93,9 @@ namespace NAADF.World.Data
         // (only while above thinWaterMinSpreadFill when the neighbor also rests on solid), and over edges onto unsupported cells; 0 turns it off
         public float thinWaterFlowPerSecond = 3f;
 
+        // Velocity advection first fills the faces next to the fluid that aren't present with the average of their present neighbors (Bridson)
+        public bool extrapolateIntoAir = true;
+
         // Stagnant dim cells lose evaporationPerSecond of fill per second instead of being removed all at once
         public bool gradualEvaporation = true;
         public float evaporationPerSecond = 0.05f;
@@ -100,7 +104,7 @@ namespace NAADF.World.Data
         public static readonly string[] StageNames = { "BeginTick", "Gravity", "AdvectVelocity", "Sources", "Project", "Extrapolate", "AdvectFill", "ThinWater", "Prune", "Damping", "Clamp" };
         public readonly double[] stageMs = new double[11]; // time spent per stage, accumulated until the owner clears it
         public int lastPrunedBySolid, lastPrunedByEmpty, lastDrained;
-        public int lastLiquidCells, lastPressureIterations;
+        public int lastLiquidCells, lastPressureIterations, lastSealedCells;
         public float lastPressureResidual;
         public float volumeInjected, volumeClampedAway, volumeClampCreated;
         public float volumePrunedSolid, volumePrunedEmpty, volumePrunedStagnant, volumeDrained;
@@ -259,6 +263,7 @@ namespace NAADF.World.Data
                 if (solidRefreshSlot >= slots)
                     solidRefreshSlot = 0;
                 Array.Clear(grid.solid, solidRefreshSlot << SparseFluidGrid.CellShift, SparseFluidGrid.BrickCells);
+                grid.MarkSolidDirty(solidRefreshSlot);
                 solidRefreshSlot++;
             }
         }
@@ -267,6 +272,8 @@ namespace NAADF.World.Data
         private void ClearSolidCache()
         {
             Array.Clear(grid.solid, 0, grid.SlotCount * SparseFluidGrid.BrickCells);
+            for (int slot = 0; slot < grid.SlotCount; slot++)
+                grid.MarkSolidDirty(slot);
             solidOutsideBricks.Clear();
         }
 
@@ -275,6 +282,18 @@ namespace NAADF.World.Data
         {
             grid.ClearSolid(min, max);
             solidOutsideBricks.Clear();
+        }
+
+        // Queries the solid state of every cell of one brick slot that isn't known yet
+        public void FillSolidSlot(int slot)
+        {
+            if (!grid.IsSlotAllocated(slot))
+                return;
+
+            int start = slot << SparseFluidGrid.CellShift;
+            for (int local = 0; local < SparseFluidGrid.BrickCells; local++)
+                if (grid.solid[start + local] == 0)
+                    grid.solid[start + local] = SolidState(grid.CellPosition(start + local));
         }
 
         // Queries the solid state of every cell of every brick that isn't known yet; returns whether there were any
@@ -369,6 +388,9 @@ namespace NAADF.World.Data
         // Semi-Lagrangian: every face of every tracked cell takes the velocity found by tracing back from its center
         public void AdvectVelocity(float dt)
         {
+            if (extrapolateIntoAir)
+                ExtrapolateIntoAir();
+
             byte[] tracked = grid.tracked;
             for (int slot = 0; slot < grid.SlotCount; slot++)
             {
@@ -413,6 +435,50 @@ namespace NAADF.World.Data
             }
 
             (grid.face, grid.faceScratch) = (grid.faceScratch, grid.face);
+        }
+
+        // Velocity extrapolation into the air (Bridson), one layer deep: every face that isn't present and isn't against solid takes the
+        // average of the present faces next to it along the same axis, so the back-trace near the fluid's edge doesn't sample zeros.
+        // Velocity advection sets these faces back to zero afterwards, as they still border no tracked cell
+        private void ExtrapolateIntoAir()
+        {
+            for (int axis = 0; axis < 3; axis++)
+            {
+                float[] f = grid.face[axis];
+                byte[] present = grid.facePresent[axis];
+                Point3 offset = SparseFluidGrid.AxisOffsets[axis];
+                for (int slot = 0; slot < grid.SlotCount; slot++)
+                {
+                    if (!grid.IsSlotAllocated(slot))
+                        continue;
+
+                    int start = slot << SparseFluidGrid.CellShift;
+                    for (int i = start; i < start + SparseFluidGrid.BrickCells; i++)
+                    {
+                        if (present[i] != 0)
+                            continue;
+
+                        float sum = 0f;
+                        int count = 0;
+                        for (int d = 0; d < 6; d++)
+                        {
+                            int n = grid.NeighborIndex(i, d >> 1, (d & 1) == 0 ? 1 : -1);
+                            if (n >= 0 && present[n] != 0)
+                            {
+                                sum += f[n];
+                                count++;
+                            }
+                        }
+                        if (count == 0)
+                            continue;
+
+                        Point3 lower = grid.CellPosition(i);
+                        if (IsSolid(i, lower) || IsSolid(grid.NeighborIndex(i, axis, 1), lower + offset))
+                            continue;
+                        f[i] = (float)((double)sum / count);
+                    }
+                }
+            }
         }
 
         // Source cells are held full, and all their faces are held at the source velocity through the pressure solve
@@ -543,6 +609,7 @@ namespace NAADF.World.Data
             int n = liquidList.Count;
             lastPressureIterations = 0;
             lastPressureResidual = 0f;
+            lastSealedCells = 0;
             if (n == 0)
             {
                 foreach (int index in previousLiquidList)
@@ -562,6 +629,8 @@ namespace NAADF.World.Data
                 z = new double[capacity];
                 s = new double[capacity];
                 q = new double[capacity];
+                component = new int[capacity];
+                componentQueue = new int[capacity];
             }
 
             // neighbor[i*6+d]: liquid index, -1 air, -2 solid/source; direction d = axis*2 + (0 = +, 1 = -)
@@ -609,6 +678,7 @@ namespace NAADF.World.Data
                 x[i] = grid.pressure[cell];
             }
 
+            RemoveSealedMeans(n);
             SolvePressure(n);
 
             foreach (int index in previousLiquidList)
@@ -705,6 +775,51 @@ namespace NAADF.World.Data
             {
                 int index = update.index >= 0 ? update.index : grid.EnsureCellIndex(update.lower);
                 grid.SetFaceAt(update.axis, index, update.value);
+            }
+        }
+
+        // A connected group of liquid cells with no air neighbor has its pressure fixed only up to a constant, and A p = b
+        // only has a solution when b sums to zero over the group, so the group's mean is taken out of b (Bridson)
+        private void RemoveSealedMeans(int n)
+        {
+            lastSealedCells = 0;
+            for (int i = 0; i < n; i++)
+                component[i] = -1;
+
+            for (int start = 0; start < n; start++)
+            {
+                if (component[start] >= 0)
+                    continue;
+
+                int head = 0, tail = 0;
+                bool open = false;
+                double sum = 0.0;
+                component[start] = start;
+                componentQueue[tail++] = start;
+                while (head < tail)
+                {
+                    int i = componentQueue[head++];
+                    sum += b[i];
+                    for (int d = 0; d < 6; d++)
+                    {
+                        int j = neighbor[i * 6 + d];
+                        if (j == -1)
+                            open = true;
+                        else if (j >= 0 && component[j] < 0)
+                        {
+                            component[j] = start;
+                            componentQueue[tail++] = j;
+                        }
+                    }
+                }
+
+                // A single cell has no liquid neighbor, its diagonal is forced to 1 and its equation is not singular
+                if (open || tail == 1)
+                    continue;
+                double mean = sum / tail;
+                for (int k = 0; k < tail; k++)
+                    b[componentQueue[k]] -= mean;
+                lastSealedCells += tail;
             }
         }
 
