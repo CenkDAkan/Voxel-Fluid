@@ -203,7 +203,6 @@ namespace NAADF.World.Data
                 face[axis].buffer = CreateBuffer(typeof(float), gridCells);
                 faceScratchBuffer[axis] = CreateBuffer(typeof(float), gridCells);
                 ZeroCells(faceScratchBuffer[axis], zeroFloats, 0, gridCells);
-                faceReadback[axis] = new float[gridCells];
             }
             pressure.buffer = CreateBuffer(typeof(float), gridCells);
             fill.buffer = CreateBuffer(typeof(float), gridCells);
@@ -240,9 +239,18 @@ namespace NAADF.World.Data
             byteUpload = new uint[gridCells / 4];
             stateUpload = new uint[gridCells];
             stateReadback = new uint[gridCells];
-            pressureReadback = new float[gridCells];
-            fillReadback = new float[gridCells];
             summaryReadback = new uint[slotCapacity];
+        }
+
+        // The arrays the self-check reads the GPU's results into, only allocated once the self-check runs
+        private void EnsureSelfCheckArrays()
+        {
+            if (pressureReadback != null && pressureReadback.Length >= cellCapacity)
+                return;
+            for (int axis = 0; axis < 3; axis++)
+                faceReadback[axis] = new float[cellCapacity];
+            pressureReadback = new float[cellCapacity];
+            fillReadback = new float[cellCapacity];
         }
 
         // Writes zeros into count cells of a buffer from cell start on
@@ -709,6 +717,7 @@ namespace NAADF.World.Data
             }
             else
             {
+                EnsureSelfCheckArrays();
                 if ((writes & Arrays.Faces) != 0)
                     for (int axis = 0; axis < 3; axis++)
                         face[axis].buffer.GetData(faceReadback[axis], 0, cells);

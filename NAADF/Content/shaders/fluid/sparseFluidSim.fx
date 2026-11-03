@@ -167,6 +167,7 @@ groupshared uint sharedTracked;
 groupshared uint sharedLiquid;
 groupshared uint sharedChanged;
 groupshared uint sharedSealed;
+groupshared uint sharedAnyLabel;
 
 #define REDUCE_THREADS 1024
 #define REDUCE_FOLD 32
@@ -774,7 +775,8 @@ void forceSettleSealedLabels()
 
 // One round: each liquid cell takes the lowest label of its liquid neighbors in other bricks once, then of those in its own brick
 // for LABEL_STEPS steps. Counts whether any label changed and how many liquid cells are still sealed, labels only ever decrease,
-// so a round in which nothing changed means every group carries its lowest label, or LABEL_OPEN if any of its cells touches air
+// so a round in which nothing changed means every group carries its lowest label, or LABEL_OPEN if any of its cells touches air.
+// A brick none of whose cells is still sealed can neither change nor count anything, and skips the round
 [numthreads(8, 8, 8)]
 void propagateSealedLabels(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 {
@@ -787,7 +789,14 @@ void propagateSealedLabels(uint3 groupID : SV_GroupID, uint localIndex : SV_Grou
     {
         sharedChanged = 0;
         sharedSealed = 0;
+        sharedAnyLabel = 0;
     }
+    GroupMemoryBarrierWithGroupSync();
+    if (own > LABEL_OPEN)
+        sharedAnyLabel = 1;
+    GroupMemoryBarrierWithGroupSync();
+    if (sharedAnyLabel == 0)
+        return;
 
     if (own > LABEL_OPEN)
     {

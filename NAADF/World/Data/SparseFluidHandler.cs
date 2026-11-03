@@ -206,8 +206,12 @@ namespace NAADF.World.Data
                 gpu.measureKernels = gpuMeasureKernels;
                 gpu.logging = loggingEnabled;
             }
-            else
-                gpu?.Release();
+            else if (gpu != null)
+            {
+                // Hands the state back to the CPU and frees the GPU buffers, switching the GPU back on creates them again
+                gpu.Dispose();
+                gpu = null;
+            }
 
             if (loggingEnabled && !wasLogging)
                 StartLogging();
@@ -493,6 +497,13 @@ namespace NAADF.World.Data
             if (ay >= az)
                 return new Point3(0, MathF.Sign(v.Y) >= 0 ? 1 : -1, 0);
             return new Point3(0, 0, MathF.Sign(v.Z) >= 0 ? 1 : -1);
+        }
+
+        // Frees the GPU simulation's buffers, when the world this handler belongs to is disposed
+        public void Dispose()
+        {
+            gpu?.Dispose();
+            gpu = null;
         }
 
         // Erases every cell and marker this handler has drawn and drops all simulation state

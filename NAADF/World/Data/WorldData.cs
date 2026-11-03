@@ -633,6 +633,7 @@ namespace NAADF.World.Data
             entityHandler?.Dispose();
             changeHandler?.Dispose();
             blockVoxelCountGpu?.Dispose();
+            sparseFluidHandler?.Dispose();
         }
     }
 }

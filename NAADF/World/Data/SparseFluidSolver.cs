@@ -1017,10 +1017,13 @@ namespace NAADF.World.Data
                 transfers[k] = t;
             }
 
+            // The scratch arrays go back to zero, as the rest of AdvectFill only clears the entries it used itself
             for (int k = 0; k < count; k++)
             {
                 Transfer t = transfers[k];
                 delta[t.donor] = delta[t.receiver] = 0f;
+                gains[t.donor] = gains[t.receiver] = 0f;
+                losses[t.donor] = losses[t.receiver] = 0f;
             }
         }
 
