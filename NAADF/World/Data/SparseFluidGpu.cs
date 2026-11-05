@@ -97,6 +97,7 @@ namespace NAADF.World.Data
         private uint[] summaryReadback;
         private int[] sourceUpload = new int[0];
         private readonly List<int> previousSourceCells = new List<int>();
+        private int[] previousSourceUpload = new int[0];
         private int sourceCount;
         private readonly float[] scalarsReadback = new float[8];
         private readonly uint[] sealedStatusReadback = new uint[8];
@@ -129,7 +130,7 @@ namespace NAADF.World.Data
 
         // The pressure solve dispatches conjugate gradient iterations in batches, iterations after convergence do nothing
         // The first batch is sized from what the previous tick needed, and further batches follow until the solve has converged
-        private const int minPressureIterations = 16, maxPressureIterations = 300;
+        private const int minPressureIterations = 16, maxPressureIterations = SparseFluidSolver.maxPressureIterations;
         private int pressureIterations = 32;
 
         // Rounds of sealed-liquid label propagation are dispatched in batches the same way, until a round changes nothing
@@ -459,6 +460,21 @@ namespace NAADF.World.Data
             return true;
         }
 
+        // One bit per cell, as ReadVisibleMask, for cells above threshold whose center speed exceeds speed. false when the GPU doesn't hold the newest data
+        public bool ReadFastMask(uint[] target, float threshold, float speed)
+        {
+            if (cellCapacity == 0 || state.cpuCurrent || fill.cpuCurrent || face[0].cpuCurrent || face[1].cpuCurrent || face[2].cpuCurrent)
+                return false;
+
+            BindBuffers();
+            effect.Parameters["visibilityThreshold"].SetValue(threshold);
+            effect.Parameters["fastSpeedSquared"].SetValue(speed * speed);
+            int elements = slots * (SparseFluidGrid.BrickCells / 32);
+            Dispatch("BuildFastMask", (elements + 63) / 64);
+            visibleMaskBuffer.GetData(target, 0, elements);
+            return true;
+        }
+
         // Hands the whole state back to the grid, so that it may be changed there
         public void Release()
         {
@@ -492,6 +508,10 @@ namespace NAADF.World.Data
             effect.Parameters["brickSum"].SetValue(brickSumBuffer);
             effect.Parameters["brickMax"].SetValue(brickMaxBuffer);
             effect.Parameters["scalars"].SetValue(scalarsBuffer);
+            effect.Parameters["pcgDiagRead"].SetValue(diagBuffer);
+            effect.Parameters["pcgSRead"].SetValue(sBuffer);
+            effect.Parameters["pcgQRead"].SetValue(qBuffer);
+            effect.Parameters["scalarsRead"].SetValue(scalarsBuffer);
             effect.Parameters["sealedLabel"].SetValue(sealedLabelBuffer);
             effect.Parameters["sealedStatus"].SetValue(sealedStatusBuffer);
             effect.Parameters["sealedSums"].SetValue(sealedSumsBuffer);
@@ -532,7 +552,7 @@ namespace NAADF.World.Data
             effect.Parameters["minInterfaceTheta"].SetValue(SparseFluidSolver.minInterfaceTheta);
             effect.Parameters["pressureTolerance"].SetValue(SparseFluidSolver.pressureTolerance);
             effect.Parameters["minFillEpsilon"].SetValue(SparseFluidSolver.minFillEpsilon);
-            effect.Parameters["stagnantLimit"].SetValue(solver.stagnantTicksBeforeDestroy);
+            effect.Parameters["stagnantLimit"].SetValue(solver.stagnantTicksBeforeEvaporation);
             effect.Parameters["keepSurfaceFilm"].SetValue(solver.keepSurfaceFilm ? 1 : 0);
             effect.Parameters["donorAcceptorFill"].SetValue(solver.donorAcceptorFill ? 1 : 0);
             effect.Parameters["thinWaterRate"].SetValue(solver.ThinWaterRate(dt));
@@ -843,7 +863,12 @@ namespace NAADF.World.Data
             if (sourceCount > 0)
                 sourceBuffer.SetData(sourceUpload, 0, sourceCount * 8);
             if (previousSourceCells.Count > 0)
-                previousSourceBuffer.SetData(previousSourceCells.ToArray(), 0, previousSourceCells.Count);
+            {
+                if (previousSourceUpload.Length < previousSourceCells.Count)
+                    previousSourceUpload = new int[sourceCapacity];
+                previousSourceCells.CopyTo(previousSourceUpload);
+                previousSourceBuffer.SetData(previousSourceUpload, 0, previousSourceCells.Count);
+            }
 
             effect.Parameters["sourceCells"].SetValue(sourceBuffer);
             effect.Parameters["previousSourceCells"].SetValue(previousSourceBuffer);
@@ -998,7 +1023,7 @@ namespace NAADF.World.Data
             solver.volumePrunedStagnant += ledgerReadback[LedgerPrunedStagnant];
             solver.volumeDrained += ledgerReadback[LedgerDrained];
             solver.lastPrunedBySolid = (int)ledgerReadback[LedgerCountSolid];
-            solver.lastPrunedByEmpty = (int)ledgerReadback[LedgerCountEmpty];
+            solver.lastPrunedEmptyOrStagnant = (int)ledgerReadback[LedgerCountEmpty];
             solver.lastDrained = (int)ledgerReadback[LedgerCountDrained];
         }
 

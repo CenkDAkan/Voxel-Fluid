@@ -160,8 +160,6 @@ namespace NAADF.World.Data
             else if (mode == FluidSimulationMode.DenseEulerian)
                 denseFluidHandler.SeedDefaultScenario();
             // Sparse Eulerian starts empty; fluid comes from the P / T / J keys or the basin fill
-            //else if (mode == FluidSimulationMode.SparseEulerian)
-            //    sparseFluidHandler.SeedDefaultScenario();
         }
 
         // Builds the entire world on the GPU one worldGen segment at a time, then pulls the resulting

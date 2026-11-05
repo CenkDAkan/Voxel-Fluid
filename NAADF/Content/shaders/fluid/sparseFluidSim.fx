@@ -81,6 +81,7 @@ float gravityStep;   // downward velocity added per tick
 float velocityScale; // damping factor per tick
 float maxSpeed;
 float visibilityThreshold;
+float fastSpeedSquared; // buildFastMask: squared speed above which a cell counts as fast
 int stagnantLimit; // ticks a dim cell may go without gaining fill
 int keepSurfaceFilm; // SparseFluidSolver.keepSurfaceFilm, 0 or 1
 int donorAcceptorFill; // SparseFluidSolver.donorAcceptorFill, 0 or 1
@@ -123,6 +124,10 @@ RWStructuredBuffer<float> pcgQ;
 RWStructuredBuffer<float> brickSum; // per slot
 RWStructuredBuffer<float> brickMax; // per slot
 RWStructuredBuffer<float> scalars;
+StructuredBuffer<float> pcgDiagRead; // read-only names of pcgDiag, pcgS, pcgQ and scalars, so a kernel that only reads them binds no UAV for them
+StructuredBuffer<float> pcgSRead;
+StructuredBuffer<float> pcgQRead;
+StructuredBuffer<float> scalarsRead;
 RWStructuredBuffer<uint> sealedLabel;  // per cell, see LABEL_OPEN
 RWStructuredBuffer<uint> sealedStatus; // SEALED_STATUS_* counters
 RWStructuredBuffer<uint> sealedSums;   // four per group: low byte, second byte and the signed rest of the fixed-point residual sum, then the cell count
@@ -460,8 +465,8 @@ void applySources()
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Pressure projection: changes faceRw* in place, using fill, cellFlags, solidMask and the previous tick's pressure as the starting guess
-// Same system as SparseFluidSolver.SolveProjectionCpu: Jacobi-preconditioned conjugate gradient over the liquid cells
+// Pressure projection: changes faceRw* in place, using fill, cellState, solidMask and the previous tick's pressure as the starting guess
+// Same system as SparseFluidSolver.SolveProjection: Jacobi-preconditioned conjugate gradient over the liquid cells
 // Iterations are dispatched in batches, once the residual is within tolerance the remaining ones of a batch do nothing
 // The sums an iteration needs are folded per brick inside the per-cell kernels, and over the bricks by the Finalize* kernels
 
@@ -1061,16 +1066,16 @@ void updateSolution(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex)
 {
     int slot = (int) groupID.x;
     int index = (slot << CELL_SHIFT) | (int) localIndex;
-    float alpha = scalars[SCALAR_ALPHA];
-    float diag = pcgDiag[index];
+    float alpha = scalarsRead[SCALAR_ALPHA];
+    float diag = pcgDiagRead[index];
     float r = 0.0f;
     if (diag > 0.0f)
     {
         r = pcgR[index];
         if (alpha != 0.0f)
         {
-            pressure[index] += alpha * pcgS[index];
-            r -= alpha * pcgQ[index];
+            pressure[index] += alpha * pcgSRead[index];
+            r -= alpha * pcgQRead[index];
             pcgR[index] = r;
         }
     }
@@ -1241,8 +1246,9 @@ void extrapolateIntoSupportedAir(uint3 groupID : SV_GroupID, uint localIndex : S
 
 // ---------------------------------------------------------------------------------------------------------
 // Fill transport: reads face*, fill and solidMask, writes fillRaw and fillStatus
-// Same donor-cell scheme as SparseFluidSolver.AdvectFillCpu. Instead of a list of transfers, three passes each gather over the six faces of a cell:
+// Same scheme as SparseFluidSolver.AdvectFill. Instead of a list of transfers, three passes each gather over the six faces of a cell:
 // outflow totals per donor, inflow totals per receiver, then the change in fill
+// With donorAcceptorFill, a fourth pass before the last one gathers the corrections towards the donor-acceptor fluxes
 // A cell goes through its faces in the order the CPU version meets them (by index of the face's lower cell, then by axis) and the arithmetic
 // is marked precise, so every sum rounds exactly like the CPU version
 
@@ -1260,6 +1266,7 @@ CellFaces FacesOf(int index)
     CellFaces faces;
     int key[6];
     int k;
+    [unroll]
     for (k = 0; k < 3; k++)
     {
         int below = NeighborCell(index, k, -1);
@@ -1276,6 +1283,7 @@ CellFaces FacesOf(int index)
     }
 
     // order[n] = the face that has exactly n faces before it
+    [unroll]
     for (int n = 0; n < 6; n++)
     {
         faces.order[n] = 0;
@@ -1368,7 +1376,7 @@ uint SurfaceAxes(int index, float ownFill)
         gradient[a] = g;
     }
     uint axes = 0;
-    for (int axis = 0; axis < 3; axis++)
+    for (uint axis = 0; axis < 3; axis++)
     {
         float largestOther = max(gradient[(axis + 1) % 3], gradient[(axis + 2) % 3]);
         if (gradient[axis] > 0.0f && gradient[axis] >= largestOther)
@@ -1747,7 +1755,7 @@ void pruneStaleCells(uint3 groupID : SV_GroupID, uint localIndex : SV_GroupIndex
         {
             volume = ownFill;
             fillRw[index] = 0.0f;
-            state &= STATE_PRESENT_ALL;
+            state &= STATE_PRESENT_ALL | STATE_LIQUID; // the liquid bit stays until the next classification, RestsOnLiquid of the cell above reads it
         }
         cellStateRw[index] = state;
     }
@@ -1855,6 +1863,34 @@ void buildVisibleMask(uint3 globalID : SV_DispatchThreadID)
     for (int k = 0; k < 32; k++)
     {
         if ((cellState[start + k] & STATE_TRACKED) != 0 && fill[start + k] > visibilityThreshold)
+            bits |= 1u << k;
+    }
+    visibleMask[element] = bits;
+}
+
+// One thread per 32 cells: tracked, above the visibility threshold, and moving faster than fastSpeedSquared allows,
+// the speed taken at the cell center from the average of each axis' two faces
+[numthreads(64, 1, 1)]
+void buildFastMask(uint3 globalID : SV_DispatchThreadID)
+{
+    int element = (int) globalID.x;
+    if (element >= slotCount * (BRICK_CELLS / 32))
+        return;
+
+    int start = element * 32;
+    uint bits = 0;
+    for (int k = 0; k < 32; k++)
+    {
+        int index = start + k;
+        if ((cellState[index] & STATE_TRACKED) == 0 || fill[index] <= visibilityThreshold)
+            continue;
+        float speedSquared = 0.0f;
+        for (int axis = 0; axis < 3; axis++)
+        {
+            float center = (ReadFace(axis, index) + ReadFace(axis, NeighborCell(index, axis, -1))) * 0.5f;
+            speedSquared += center * center;
+        }
+        if (speedSquared > fastSpeedSquared)
             bits |= 1u << k;
     }
     visibleMask[element] = bits;
@@ -2044,5 +2080,10 @@ technique Tech0
     pass BuildVisibleMask
     {
         ComputeShader = compile cs_5_0 buildVisibleMask();
+    }
+
+    pass BuildFastMask
+    {
+        ComputeShader = compile cs_5_0 buildFastMask();
     }
 }

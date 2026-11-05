@@ -13,6 +13,7 @@ using NAADF.Gui;
 using NAADF.World.Data;
 using NAADF.World.Render;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 
@@ -191,16 +192,28 @@ namespace NAADF
                 ImGui.Separator();
                 ImGui.Text("P = drop a blob, T = tap, J = sprinkler");
 
-                ImGui.SliderFloat("Emitter speed", ref App.worldHandler.worldData.sparseFluidHandler.emitterSpeed, 0f, 30f);
-                ImGuiCommon.HelperIcon("Launch speed of all emitters, in voxels/s. Speeds above ~31 are capped by the per-tick velocity clamp.", 500);
+                SparseFluidHandler emitterHandler = App.worldHandler.worldData.sparseFluidHandler;
+                ImGui.Text("New emitters");
+                ImGui.SliderFloat("Emitter speed", ref emitterHandler.emitterSpeed, 0f, 30f);
+                ImGuiCommon.HelperIcon("Launch speed given to new emitters, in voxels/s. Speeds above ~31 are capped by the per-tick velocity clamp.", 500);
+                NozzleSizeCombo("Nozzle size", ref emitterHandler.emitterNozzleRadius);
+                ImGui.SliderFloat("Sprinkler arc", ref emitterHandler.sprinklerArcDegrees, 0f, 360f);
+                ImGui.SliderFloat("Sprinkler sweep speed", ref emitterHandler.sprinklerAngularSpeedDegPerSec, 0f, 360f);
+                ImGui.SliderFloat("Sprinkler tilt", ref emitterHandler.sprinklerTiltDegrees, 0f, 89f);
+                ImGuiCommon.HelperIcon("Arc (degrees), sweep speed (degrees/s) and upward tilt (degrees) given to new sprinklers. New taps fire horizontally. Each emitter can be changed afterwards below.", 500);
 
-                ImGui.SliderFloat("Sprinkler arc", ref App.worldHandler.worldData.sparseFluidHandler.sprinklerArcDegrees, 0f, 360f);
-                ImGui.SliderFloat("Sprinkler sweep speed", ref App.worldHandler.worldData.sparseFluidHandler.sprinklerAngularSpeedDegPerSec, 0f, 360f);
-                ImGui.SliderFloat("Sprinkler tilt", ref App.worldHandler.worldData.sparseFluidHandler.sprinklerTiltDegrees, 0f, 89f);
-                ImGuiCommon.HelperIcon("Arc (degrees), sweep speed (degrees/s) and upward tilt (degrees) shared by all sprinklers.", 500);
+                EmitterList(emitterHandler);
 
                 if (ImGui.Button("Remove all emitters"))
-                    App.worldHandler.worldData.sparseFluidHandler.RemoveAllEmitters();
+                    emitterHandler.RemoveAllEmitters();
+
+                ImGui.Separator();
+                ImGui.Checkbox("Colour variation", ref emitterHandler.colorVariation);
+                ImGuiCommon.HelperIcon("Fluid cells are drawn in random shades from deep blue to light cyan, fast-moving ones leaning to foam. Off, all fluid is drawn in plain cyan (cells already drawn keep their shade until redrawn).", 500);
+                ImGui.SliderFloat("Foam speed", ref emitterHandler.foamSpeed, 0f, 30f, "%.1f");
+                ImGuiCommon.HelperIcon("Speed in voxels/s above which a cell counts as fast and takes the foam shades; it changes shade when it crosses this speed.", 500);
+                ImGui.SliderFloat("Shimmer", ref emitterHandler.shimmerPerSecond, 0f, 1f, "%.2f");
+                ImGuiCommon.HelperIcon("Share of the drawn cells that pick a new shade each second, so resting water doesn't look frozen. 0 turns it off.", 500);
 
                 ImGui.Separator();
                 SparseFluidHandler rainHandler = App.worldHandler.worldData.sparseFluidHandler;
@@ -257,7 +270,7 @@ namespace NAADF
             ImGui.SliderFloat("Top layer fill", ref basinTopFill, 0.05f, 1f, "%.2f");
             ImGuiCommon.HelperIcon("Fill of the top layer \"Fill basin\" seeds; 0.50 reproduces the half-full layer flicker. Without the debugging tools the top layer is filled completely.", 500);
 
-            ImGui.SliderInt("Stagnant ticks", ref handler.solver.stagnantTicksBeforeDestroy, 1, 300);
+            ImGui.SliderInt("Stagnant ticks", ref handler.solver.stagnantTicksBeforeEvaporation, 1, 300);
             ImGuiCommon.HelperIcon("How many CONSECUTIVE ticks a dim (below-visibility) cell must go without gaining any fill before it starts evaporating (or, with gradual evaporation off, is destroyed). Dim cells resting on liquid are never counted.", 500);
 
             ImGui.Checkbox("Gradual evaporation", ref handler.solver.gradualEvaporation);
@@ -274,6 +287,73 @@ namespace NAADF
             ImGuiCommon.HelperIcon("How fast dim water resting on solid ground flows towards neighbours holding less and over edges, as the fraction per second of the fill difference. 0 turns it off; the water then stays where it landed.", 500);
 
             ImGui.Unindent();
+        }
+
+        private static readonly string[] NozzleSizes = { "1x1", "3x3", "5x5" };
+
+        // Combo choosing a nozzle radius by its cross-section size
+        private static void NozzleSizeCombo(string label, ref int radius)
+        {
+            int current = Math.Clamp(radius, 0, NozzleSizes.Length - 1);
+            if (ImGui.BeginCombo(label, NozzleSizes[current]))
+            {
+                for (int i = 0; i < NozzleSizes.Length; i++)
+                {
+                    bool isSelected = current == i;
+                    if (ImGui.Selectable(NozzleSizes[i], isSelected))
+                        radius = i;
+                    if (isSelected)
+                        ImGui.SetItemDefaultFocus();
+                }
+                ImGui.EndCombo();
+            }
+        }
+
+        // The placed emitters, one row each to select it, and the settings of the selected one
+        private static void EmitterList(SparseFluidHandler handler)
+        {
+            IReadOnlyList<SparseFluidHandler.Emitter> emitters = handler.Emitters;
+            ImGui.Text($"Emitters ({emitters.Count})");
+            ImGuiCommon.HelperIcon("Click an emitter to select it; its marker turns yellow. The selected emitter's settings below apply to it alone.", 500);
+            for (int i = 0; i < emitters.Count; i++)
+            {
+                SparseFluidHandler.Emitter emitter = emitters[i];
+                string state = emitter.enabled ? "" : " (off)";
+                if (ImGui.Selectable($"#{i + 1} {emitter.kind} at {emitter.position.X}, {emitter.position.Y}, {emitter.position.Z}{state}##emitter{i}", handler.SelectedEmitter == i))
+                    handler.SelectEmitter(handler.SelectedEmitter == i ? -1 : i);
+            }
+
+            int selected = handler.SelectedEmitter;
+            if (selected < 0)
+                return;
+
+            SparseFluidHandler.Emitter edited = emitters[selected];
+            ImGui.Separator();
+            ImGui.Text($"Selected: #{selected + 1} {edited.kind}");
+            ImGui.Checkbox("Running", ref edited.enabled);
+            ImGui.SliderFloat("Speed", ref edited.speed, 0f, 30f);
+            ImGui.SliderFloat("Tilt", ref edited.tiltDeg, SparseFluidHandler.MinTilt(edited.kind), 89f);
+            ImGuiCommon.HelperIcon("Launch angle above the horizontal in degrees; taps can also aim downwards.", 500);
+            NozzleSizeCombo("Nozzle", ref edited.nozzleRadius);
+            if (edited.kind == SparseFluidHandler.EmitterKind.Sprinkler)
+            {
+                ImGui.SliderFloat("Arc", ref edited.arcDeg, 0f, 360f);
+                ImGui.SliderFloat("Sweep speed", ref edited.sweepSpeedDeg, 0f, 360f);
+            }
+            ImGui.SliderFloat("On for (s)", ref edited.onSeconds, 0f, 30f, "%.1f");
+            ImGui.SliderFloat("Off for (s)", ref edited.offSeconds, 0f, 30f, "%.1f");
+            ImGui.SliderFloat("Start delay (s)", ref edited.startDelaySeconds, 0f, 30f, "%.1f");
+            ImGuiCommon.HelperIcon("After the start delay the emitter runs for \"On for\", pauses for \"Off for\", and repeats. \"On for\" 0 keeps it running. The delay and cycle count from placement or from Restart timer.", 500);
+            if (ImGui.Button("Restart timer"))
+                edited.runSeconds = 0f;
+            ImGui.SameLine();
+            if (ImGui.Button("Aim along camera"))
+                handler.AimEmitterAlongCamera(selected);
+            ImGuiCommon.HelperIcon("Points the emitter the way the camera looks: its facing and its tilt (sprinklers only tilt upwards).", 500);
+            ImGui.SameLine();
+            if (ImGui.Button("Remove emitter"))
+                handler.RemoveEmitter(selected);
+            ImGui.Separator();
         }
 
         // Diagnostic switches back to their defaults

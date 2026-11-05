@@ -69,7 +69,7 @@ namespace NAADF.World.Data
         public const float maxThinWaterRate = 0.2f;
         public const float thinWaterMinSpreadFill = 0.05f;
 
-        private const int maxPressureIterations = 300;
+        public const int maxPressureIterations = 300;
 
         private static readonly Point3[] LatticeNeighbors =
         {
@@ -83,7 +83,7 @@ namespace NAADF.World.Data
         public bool enableGravity = true;
         public float gravityStrength = 20f;
         public float velocityDampingPerSecond = 0.3f; // fraction of velocity retained per second
-        public int stagnantTicksBeforeDestroy = 150;
+        public int stagnantTicksBeforeEvaporation = 150;
         public float compactionRate = 0.05f; // fraction of a liquid cell's missing fill drawn in per tick
 
         // Liquid cells pass on even negligible amounts, and dim cells resting on liquid are never pruned as empty or stagnant,
@@ -108,7 +108,7 @@ namespace NAADF.World.Data
         // Diagnostics
         public static readonly string[] StageNames = { "BeginTick", "Gravity", "AdvectVelocity", "Sources", "Project", "Extrapolate", "AdvectFill", "ThinWater", "Prune", "Damping", "Clamp" };
         public readonly double[] stageMs = new double[11]; // time spent per stage, accumulated until the owner clears it
-        public int lastPrunedBySolid, lastPrunedByEmpty, lastDrained;
+        public int lastPrunedBySolid, lastPrunedEmptyOrStagnant, lastDrained;
         public int lastLiquidCells, lastPressureIterations, lastSealedCells;
         public float lastPressureResidual;
         public float volumeInjected, volumeClampedAway, volumeClampCreated;
@@ -123,7 +123,6 @@ namespace NAADF.World.Data
 
         // Number of tracked cells
         public int Count => grid.Count;
-
 
         // Drops all fluid, cached solid lookups and flagged-cell lists
         public void Clear()
@@ -149,15 +148,6 @@ namespace NAADF.World.Data
             return volume;
         }
 
-        // Pressure from the last solve; false for cells that weren't liquid in it
-        public bool TryGetPressure(Point3 p, out float value)
-        {
-            int index = grid.CellIndex(p);
-            bool liquid = index >= 0 && grid.liquidIndex[index] != 0;
-            value = liquid ? grid.pressure[index] : 0f;
-            return liquid;
-        }
-
         // Zeroes the volume bookkeeping that the owner reads and resets between log lines
         public void ClearVolumeAccumulators()
         {
@@ -168,7 +158,6 @@ namespace NAADF.World.Data
         // Adds a sphere of fill-fraction data to the cells it covers, each capped at full; cells inside solid are skipped
         public void SeedSphere(Point3 center, int radius)
         {
-            ClearSolidCache();
             int bound = radius + 1;
             for (int x = -bound; x <= bound; x++)
                 for (int y = -bound; y <= bound; y++)
@@ -193,7 +182,6 @@ namespace NAADF.World.Data
         // Adds fluid to every non-solid cell of a box (bounds inclusive), topFill in the top layer (y = max.Y) and full elsewhere, each capped at full
         public void SeedBox(Point3 min, Point3 max, float topFill = 1f)
         {
-            ClearSolidCache();
             for (int z = min.Z; z <= max.Z; z++)
                 for (int y = min.Y; y <= max.Y; y++)
                     for (int x = min.X; x <= max.X; x++)
@@ -273,15 +261,6 @@ namespace NAADF.World.Data
             }
         }
 
-        // Forgets every cached solid lookup
-        private void ClearSolidCache()
-        {
-            Array.Clear(grid.solid, 0, grid.SlotCount * SparseFluidGrid.BrickCells);
-            for (int slot = 0; slot < grid.SlotCount; slot++)
-                grid.MarkSolidDirty(slot);
-            solidOutsideBricks.Clear();
-        }
-
         // To be called when solid geometry inside a box of cells (bounds inclusive) has changed
         public void InvalidateSolid(Point3 min, Point3 max)
         {
@@ -339,13 +318,19 @@ namespace NAADF.World.Data
             int below = grid.NeighborIndex(index, 1, -1);
             if (below < 0 || (grid.flags[below] & FlagLiquid) == 0)
                 return false;
-            byte state = grid.solid[below];
+            return (CachedSolidState(below) & (SparseFluidGrid.SolidBlocked | SparseFluidGrid.SolidDrain)) == 0;
+        }
+
+        // The solid cache byte of a cell inside a brick, queried and stored when not known yet
+        private byte CachedSolidState(int index)
+        {
+            byte state = grid.solid[index];
             if (state == 0)
             {
-                state = SolidState(grid.CellPosition(below));
-                grid.solid[below] = state;
+                state = SolidState(grid.CellPosition(index));
+                grid.solid[index] = state;
             }
-            return (state & (SparseFluidGrid.SolidBlocked | SparseFluidGrid.SolidDrain)) == 0;
+            return state;
         }
 
         // Whether a cell is solid: cached per cell inside bricks, cached for the tick outside them
@@ -579,7 +564,7 @@ namespace NAADF.World.Data
         }
 
         // Decides which cells are liquid for this tick's pressure solve
-        public void ClassifyLiquidCells()
+        private void ClassifyLiquidCells()
         {
             // Last tick's liquid cells keep their pressure, as the warm start, until the new system has read it
             (liquidList, previousLiquidList) = (previousLiquidList, liquidList);
@@ -607,7 +592,7 @@ namespace NAADF.World.Data
         }
 
         // The pressure solve itself, for the cells ClassifyLiquidCells marked
-        public void SolveProjection(float dt)
+        private void SolveProjection(float dt)
         {
             ZeroSolidFaces();
 
@@ -1274,7 +1259,7 @@ namespace NAADF.World.Data
         {
             float evaporation = EvaporationStep(dt);
             lastPrunedBySolid = 0;
-            lastPrunedByEmpty = 0;
+            lastPrunedEmptyOrStagnant = 0;
             lastDrained = 0;
 
             int end = grid.SlotCount * SparseFluidGrid.BrickCells;
@@ -1284,8 +1269,8 @@ namespace NAADF.World.Data
                     continue;
 
                 float fill = grid.fill[i];
-                Point3 pos = grid.CellPosition(i);
-                if (isDrain != null && isDrain(pos))
+                byte solidState = CachedSolidState(i);
+                if ((solidState & SparseFluidGrid.SolidDrain) != 0)
                 {
                     grid.Untrack(i);
                     lastDrained++;
@@ -1293,7 +1278,7 @@ namespace NAADF.World.Data
                     continue;
                 }
 
-                if (IsSolid(i, pos))
+                if ((solidState & SparseFluidGrid.SolidBlocked) != 0)
                 {
                     grid.Untrack(i);
                     lastPrunedBySolid++;
@@ -1310,7 +1295,7 @@ namespace NAADF.World.Data
                 if (fill <= minFillEpsilon)
                 {
                     grid.Untrack(i);
-                    lastPrunedByEmpty++;
+                    lastPrunedEmptyOrStagnant++;
                     volumePrunedEmpty += fill;
                     continue;
                 }
@@ -1325,7 +1310,7 @@ namespace NAADF.World.Data
                 }
 
                 grid.ticksStagnant[i]++;
-                if (grid.ticksStagnant[i] >= stagnantTicksBeforeDestroy)
+                if (grid.ticksStagnant[i] >= stagnantTicksBeforeEvaporation)
                 {
                     float left = fill - evaporation;
                     if (evaporation > 0f && left > minFillEpsilon)
@@ -1335,7 +1320,7 @@ namespace NAADF.World.Data
                         continue;
                     }
                     grid.Untrack(i);
-                    lastPrunedByEmpty++;
+                    lastPrunedEmptyOrStagnant++;
                     volumePrunedStagnant += fill;
                 }
             }

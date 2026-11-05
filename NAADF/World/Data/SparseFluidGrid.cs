@@ -15,11 +15,6 @@ namespace NAADF.World.Data
     */
     public class SparseFluidGrid
     {
-        public struct Cell
-        {
-            public float fill;
-            public int ticksStagnant; // consecutive ticks at or below the visibility threshold without gaining fill
-        }
 
         public static readonly Point3[] AxisOffsets =
         {
@@ -46,7 +41,7 @@ namespace NAADF.World.Data
         // Per-cell data
         public byte[] tracked;
         public float[] fill;
-        public int[] ticksStagnant;
+        public int[] ticksStagnant; // consecutive ticks at or below the visibility threshold without gaining fill
         public float[][] face = new float[3][];
         public byte[][] facePresent = new byte[3][];
         public float[][] faceScratch = new float[3][];
@@ -63,7 +58,7 @@ namespace NAADF.World.Data
         private bool[] brickAllocated;
         private int[] brickTracked;
         private byte[] brickBorder; // whether tracked cells lie along each of the brick's six faces: bit axis * 2 + (0 = low side, 1 = high side)
-        public int[] brickFacesPresent;
+        public int[] brickFacesPresent; // above 0 when the brick holds any present face (a count from the CPU, 0 or 1 after SetBrickSummary)
         private int[] neighbor; // slot of each of the 27 surrounding bricks (self included), -1 where there is none
         private bool[] brickNeeded;
 
@@ -255,9 +250,6 @@ namespace NAADF.World.Data
                 target[slot * 4 + 3] = brickAllocated[slot] ? 1 : 0;
             }
         }
-
-        // Number of tracked cells in a brick slot
-        public int TrackedInSlot(int slot) => brickTracked[slot];
 
         // World position of the lowest corner cell of a brick slot
         public Point3 SlotOrigin(int slot) => new Point3(brickX[slot] << BrickShift, brickY[slot] << BrickShift, brickZ[slot] << BrickShift);
@@ -558,40 +550,11 @@ namespace NAADF.World.Data
             return keys;
         }
 
-        // Fill and stagnation counter of the cell at a key, false when the cell isn't tracked
-        public bool TryGetCell(long key, out Cell cell)
-        {
-            int index = CellIndex(Unpack(key));
-            if (index < 0 || tracked[index] == 0)
-            {
-                cell = default;
-                return false;
-            }
-            cell = new Cell { fill = fill[index], ticksStagnant = ticksStagnant[index] };
-            return true;
-        }
-
-        // Fill and stagnation counter of the cell at a key, all zero when the cell isn't tracked
-        public Cell GetCell(long key)
-        {
-            TryGetCell(key, out Cell cell);
-            return cell;
-        }
-
         // Fill of the cell at a key, 0 when no brick covers it
         public float GetFill(long key)
         {
             int index = CellIndex(Unpack(key));
             return index < 0 ? 0f : fill[index];
-        }
-
-        // Tracks the cell at a key, allocating its brick when missing, and sets its fill and stagnation counter
-        public void SetCell(long key, Cell cell)
-        {
-            int index = EnsureCellIndex(Unpack(key));
-            Track(index);
-            fill[index] = cell.fill;
-            ticksStagnant[index] = cell.ticksStagnant;
         }
 
         // Untracks the cell at a key, if a brick covers it
@@ -623,33 +586,6 @@ namespace NAADF.World.Data
         {
             int index = CellIndex(Unpack(key));
             return index < 0 ? 0f : face[axis][index];
-        }
-
-        // Velocity through the +axis face of the cell at a key; false when that face isn't present
-        public bool TryGetFace(int axis, long key, out float value)
-        {
-            int index = CellIndex(Unpack(key));
-            if (index < 0 || facePresent[axis][index] == 0)
-            {
-                value = 0f;
-                return false;
-            }
-            value = face[axis][index];
-            return true;
-        }
-
-        // Every present face of one axis as (lower cell position, velocity), for diagnostics
-        public IEnumerable<KeyValuePair<Point3, float>> PresentFaces(int axis)
-        {
-            for (int slot = 0; slot < SlotCount; slot++)
-            {
-                if (!brickAllocated[slot] || brickFacesPresent[slot] == 0)
-                    continue;
-                int start = slot << CellShift;
-                for (int local = 0; local < BrickCells; local++)
-                    if (facePresent[axis][start + local] != 0)
-                        yield return new KeyValuePair<Point3, float>(CellPosition(start + local), face[axis][start + local]);
-            }
         }
 
         // Trilinear sample of one velocity component at an arbitrary position (cell centers sit on integer coordinates)
